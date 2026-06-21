@@ -6,14 +6,12 @@ import {
   Loader2,
   MessageCirclePlus,
   Mic,
-  Play,
   Plus,
   RefreshCw,
   Send,
   Sparkles,
   Square,
   WandSparkles,
-  Volume2,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -31,6 +29,8 @@ import type {
   GeneratedScenario,
   LessonMoreBlock,
 } from "@/lib/ai/lesson-schemas";
+import { SpeechPlaybackControls } from "@/components/audio/speech-playback-controls";
+import { useSpeechPlayback } from "@/hooks/use-speech-playback";
 import { cn } from "@/lib/utils";
 
 type Source = "openai" | "demo";
@@ -95,6 +95,7 @@ export function LessonPlayerClient() {
   const [dictating, setDictating] = useState(false);
   const recognitionRef = useRef<SpeechRecognitionLike | null>(null);
   const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const speechPlayback = useSpeechPlayback({ rate: 0.9 });
 
   const lessonForQuiz = lesson?.quickQuiz || [];
   const [quizAnswers, setQuizAnswers] = useState<Record<number, string>>({});
@@ -285,6 +286,7 @@ export function LessonPlayerClient() {
   }
 
   function startScenario(scenario: GeneratedScenario) {
+    speechPlayback.stop();
     setActiveScenario(scenario);
     setReport(null);
     setMessages([
@@ -333,17 +335,21 @@ export function LessonPlayerClient() {
         throw new Error(readErrorMessage(data, "Could not continue conversation."));
       }
 
+      const aiMessageId = crypto.randomUUID();
       setMessages((current) => [
         ...current,
         {
-          id: crypto.randomUUID(),
+          id: aiMessageId,
           role: "ai",
           content: data.data.aiGermanReply,
           hint: data.data.englishHint,
           correction: data.data.correction,
         },
       ]);
-      speakGerman(data.data.aiGermanReply);
+      speechPlayback.play(
+        `lesson-message-${aiMessageId}`,
+        data.data.aiGermanReply,
+      );
     } catch (caughtError) {
       setError(
         caughtError instanceof Error
@@ -441,18 +447,6 @@ export function LessonPlayerClient() {
     recognitionRef.current = recognition;
     setDictating(true);
     recognition.start();
-  }
-
-  function speakGerman(text: string) {
-    if (!("speechSynthesis" in window)) {
-      return;
-    }
-
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(text);
-    utterance.lang = "de-DE";
-    utterance.rate = 0.9;
-    window.speechSynthesis.speak(utterance);
   }
 
   return (
@@ -566,14 +560,12 @@ export function LessonPlayerClient() {
                 {lesson?.goal || "A practical lesson will appear here."}
               </p>
             </div>
-            <button
-              type="button"
-              onClick={() => lesson && speakGerman(lesson.warmupQuestion)}
-              className="flex items-center gap-2 rounded-md border border-neutral-300 px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
-            >
-              <Volume2 className="h-4 w-4" />
-              Warmup
-            </button>
+            <SpeechPlaybackControls
+              controller={speechPlayback}
+              id="lesson-warmup"
+              text={lesson?.warmupQuestion || ""}
+              playLabel="Warmup"
+            />
           </div>
 
           {lessonLoading ? (
@@ -805,14 +797,13 @@ export function LessonPlayerClient() {
                       {message.role === "learner" ? "You" : activeScenario.aiRole}
                     </p>
                     {message.role === "ai" ? (
-                      <button
-                        type="button"
-                        onClick={() => speakGerman(message.content)}
-                        className="rounded p-1 hover:bg-neutral-100"
-                        aria-label="Play German reply"
-                      >
-                        <Play className="h-3.5 w-3.5" />
-                      </button>
+                      <SpeechPlaybackControls
+                        controller={speechPlayback}
+                        id={`lesson-message-${message.id}`}
+                        text={message.content}
+                        playLabel="Play reply"
+                        compact
+                      />
                     ) : null}
                   </div>
                   <p className="mt-2 text-sm leading-6">{message.content}</p>

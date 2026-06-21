@@ -1,3 +1,4 @@
+import { analyzeSpeechAudio } from "@/lib/ai/audio-speech-feedback";
 import { generateSpeechFeedback } from "@/lib/ai/speech-feedback";
 
 export const runtime = "nodejs";
@@ -54,6 +55,10 @@ export async function POST(request: Request) {
   const mode = readFormString(formData, "mode") || "speaking-practice";
   const level = readFormString(formData, "level") || "A1";
   const target = readFormString(formData, "target");
+  const conversationTranscript = readFormString(
+    formData,
+    "conversationTranscript",
+  );
 
   const openAIForm = new FormData();
   openAIForm.append("file", audio, audio.name || "speaking-attempt.webm");
@@ -94,17 +99,36 @@ export async function POST(request: Request) {
     );
   }
 
-  const feedback = await generateSpeechFeedback({
+  const feedbackInput = {
     transcript,
     mode,
     level,
     taskTitle,
     taskPrompt,
     target: target || undefined,
+    conversationTranscript: conversationTranscript || undefined,
+  };
+  let acousticObservations = "";
+  let audioWarning = "";
+
+  try {
+    acousticObservations = await analyzeSpeechAudio(audio, feedbackInput);
+  } catch (error) {
+    audioWarning =
+      error instanceof Error
+        ? error.message
+        : "Audio-aware assessment was unavailable.";
+  }
+
+  const feedback = await generateSpeechFeedback({
+    ...feedbackInput,
+    acousticObservations: acousticObservations || undefined,
   });
 
   return Response.json({
     transcript,
+    analysisBasis: acousticObservations ? "audio" : "transcript",
+    audioWarning: audioWarning || undefined,
     ...feedback,
   });
 }

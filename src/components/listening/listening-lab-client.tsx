@@ -7,10 +7,12 @@ import {
   Clock3,
   Headphones,
   Loader2,
+  Pause,
   Play,
   RotateCcw,
   Save,
   Sparkles,
+  Square,
   Volume2,
   XCircle,
 } from "lucide-react";
@@ -20,12 +22,31 @@ import type {
   ListeningExercise,
   ListeningReport,
 } from "@/lib/ai/listening-schemas";
+import { SpeechPlaybackControls } from "@/components/audio/speech-playback-controls";
+import { useSpeechPlayback } from "@/hooks/use-speech-playback";
 import { cefrLevels, type CefrLevel } from "@/lib/curriculum";
+import {
+  customTopicValue,
+  formatDetails,
+  freshTopicValue,
+  listeningFormatOptions,
+  listeningTopicSuggestions,
+  topicRequestValue,
+} from "@/lib/listening-format";
 import { cn } from "@/lib/utils";
 
 type Source = "openai" | "demo";
 type LabStatus = "idle" | "generating" | "ready" | "grading" | "complete";
 type SaveStatus = "idle" | "saving" | "saved" | "error";
+type AudioStatus = "idle" | "playing" | "paused";
+
+type GeneratedAudioClip = {
+  speaker: string;
+  role: string;
+  voice: string;
+  text: string;
+  url: string;
+};
 
 type ApiResult<T> = {
   data: T;
@@ -49,38 +70,10 @@ type ReportResponse = ApiResult<ListeningReport> & {
   grading: GradingResult;
 };
 
-const formats: Array<{
-  value: ListeningExercise["format"];
-  label: string;
-  description: string;
-}> = [
-  { value: "dialogue", label: "Dialogue", description: "Two-person everyday exchange" },
-  {
-    value: "announcement",
-    label: "Announcement",
-    description: "Station, event, or public information",
-  },
-  {
-    value: "interview",
-    label: "Interview",
-    description: "Work, study, or personal interview",
-  },
-  { value: "story", label: "Story", description: "Narrative with sequence and detail" },
-  { value: "news", label: "News", description: "Structured report for advanced levels" },
-];
-
-const starterTopics = [
-  "Daily life and appointments",
-  "Travel and transport",
-  "German job interview",
-  "Workplace communication",
-  "University and study",
-  "Health and pharmacy",
-];
-
 export function ListeningLabClient() {
   const [level, setLevel] = useState<CefrLevel>("B1");
-  const [topic, setTopic] = useState("Daily life and appointments");
+  const [topic, setTopic] = useState(listeningTopicSuggestions.dialogue[0]);
+  const [customTopic, setCustomTopic] = useState("");
   const [format, setFormat] =
     useState<ListeningExercise["format"]>("dialogue");
   const [questionCount, setQuestionCount] = useState(5);
@@ -92,14 +85,21 @@ export function ListeningLabClient() {
   const [grading, setGrading] = useState<GradingResult | null>(null);
   const [status, setStatus] = useState<LabStatus>("idle");
   const [error, setError] = useState("");
-  const [audioUrl, setAudioUrl] = useState("");
+  const [audioClips, setAudioClips] = useState<GeneratedAudioClip[]>([]);
+  const [activeClipIndex, setActiveClipIndex] = useState(0);
   const [audioLoading, setAudioLoading] = useState(false);
   const [audioError, setAudioError] = useState("");
   const [listenCount, setListenCount] = useState(0);
   const [sessionId, setSessionId] = useState("");
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [saveMessage, setSaveMessage] = useState("");
-  const audioUrlRef = useRef("");
+  const [audioStatus, setAudioStatus] = useState<AudioStatus>("idle");
+  const audioUrlsRef = useRef<string[]>([]);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const autoAdvanceRef = useRef(false);
+  const browserSpeechPlayback = useSpeechPlayback({
+    onStart: () => setListenCount((current) => current + 1),
+  });
 
   const answeredCount = Object.keys(answers).length;
   const allAnswered = Boolean(
@@ -116,21 +116,28 @@ export function ListeningLabClient() {
 
   useEffect(() => {
     return () => {
-      if (audioUrlRef.current) {
-        URL.revokeObjectURL(audioUrlRef.current);
-      }
-      window.speechSynthesis?.cancel();
+      audioUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
   }, []);
 
+  useEffect(() => {
+    if (!autoAdvanceRef.current || !audioClips[activeClipIndex]) return;
+    void audioRef.current?.play().catch(() => {
+      autoAdvanceRef.current = false;
+      setAudioStatus("paused");
+    });
+  }, [activeClipIndex, audioClips]);
+
   async function generateExercise() {
-    if (!topic.trim()) {
+    const requestedTopic = topicRequestValue(topic, customTopic, format);
+
+    if (!requestedTopic) {
       setError("Choose or enter a listening topic first.");
       return;
     }
 
     revokeAudioUrl();
-    window.speechSynthesis?.cancel();
+    browserSpeechPlayback.stop();
     setStatus("generating");
     setError("");
     setAudioError("");
@@ -149,7 +156,12 @@ export function ListeningLabClient() {
       const response = await fetch("/api/ai/listening-exercise", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ level, topic, format, questionCount }),
+        body: JSON.stringify({
+          level,
+          topic: requestedTopic,
+          format,
+          questionCount,
+        }),
       });
       const data = (await response.json()) as
         | ApiResult<ListeningExercise>
@@ -188,7 +200,7 @@ export function ListeningLabClient() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          text: nextExercise.transcriptGerman,
+          audioScript: nextExercise.audioScript,
           level: nextExercise.level,
           format: nextExercise.format,
         }),
@@ -201,10 +213,35 @@ export function ListeningLabClient() {
         throw new Error(data?.error || "Could not generate listening audio.");
       }
 
-      const nextUrl = URL.createObjectURL(await response.blob());
+      const data = (await response.json()) as {
+        clips?: Array<{
+          speaker: string;
+          role: string;
+          voice: string;
+          text: string;
+          mimeType: string;
+          audioBase64: string;
+        }>;
+        error?: string;
+      };
+
+      if (!Array.isArray(data.clips) || !data.clips.length) {
+        throw new Error(data.error || "Listening audio returned no speaker clips.");
+      }
+
       revokeAudioUrl();
-      audioUrlRef.current = nextUrl;
-      setAudioUrl(nextUrl);
+      const nextClips = data.clips.map((clip) => ({
+        speaker: clip.speaker,
+        role: clip.role,
+        voice: clip.voice,
+        text: clip.text,
+        url: URL.createObjectURL(
+          base64ToBlob(clip.audioBase64, clip.mimeType || "audio/mpeg"),
+        ),
+      }));
+      audioUrlsRef.current = nextClips.map((clip) => clip.url);
+      setAudioClips(nextClips);
+      setActiveClipIndex(0);
     } catch (caughtError) {
       setAudioError(
         caughtError instanceof Error
@@ -345,26 +382,65 @@ export function ListeningLabClient() {
     }
   }
 
-  function playBrowserFallback() {
-    if (!exercise || !("speechSynthesis" in window)) {
-      setAudioError("Browser text-to-speech is unavailable.");
+  async function playGeneratedAudio() {
+    if (!audioRef.current || !audioClips.length) return;
+
+    try {
+      if (audioStatus === "idle" && activeClipIndex === 0) {
+        setListenCount((current) => current + 1);
+      }
+      autoAdvanceRef.current = true;
+      await audioRef.current.play();
+    } catch {
+      autoAdvanceRef.current = false;
+      setAudioError("The generated audio could not be played by this browser.");
+    }
+  }
+
+  function pauseGeneratedAudio() {
+    autoAdvanceRef.current = false;
+    audioRef.current?.pause();
+  }
+
+  async function restartGeneratedAudio() {
+    if (!audioRef.current || !audioClips.length) return;
+    autoAdvanceRef.current = true;
+    setListenCount((current) => current + 1);
+    if (activeClipIndex !== 0) {
+      setActiveClipIndex(0);
+      return;
+    }
+    audioRef.current.currentTime = 0;
+    await audioRef.current.play();
+  }
+
+  function stopGeneratedAudio() {
+    autoAdvanceRef.current = false;
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    setActiveClipIndex(0);
+    setAudioStatus("idle");
+  }
+
+  function handleAudioEnded() {
+    const nextIndex = activeClipIndex + 1;
+
+    if (nextIndex < audioClips.length) {
+      autoAdvanceRef.current = true;
+      setActiveClipIndex(nextIndex);
       return;
     }
 
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(exercise.transcriptGerman);
-    utterance.lang = "de-DE";
-    utterance.rate =
-      exercise.level === "A1" ? 0.78 : exercise.level === "A2" ? 0.84 : 0.92;
-    utterance.onstart = () => setListenCount((current) => current + 1);
-    utterance.onerror = () =>
-      setAudioError("The browser voice could not play this exercise.");
-    window.speechSynthesis.speak(utterance);
+    autoAdvanceRef.current = false;
+    setActiveClipIndex(0);
+    setAudioStatus("idle");
   }
 
   function resetLab() {
     revokeAudioUrl();
-    window.speechSynthesis?.cancel();
+    browserSpeechPlayback.stop();
     setExercise(null);
     setExerciseSource(null);
     setAnswers({});
@@ -381,11 +457,12 @@ export function ListeningLabClient() {
   }
 
   function revokeAudioUrl() {
-    if (audioUrlRef.current) {
-      URL.revokeObjectURL(audioUrlRef.current);
-      audioUrlRef.current = "";
-    }
-    setAudioUrl("");
+    stopGeneratedAudio();
+    audioUrlsRef.current.forEach((url) => URL.revokeObjectURL(url));
+    audioUrlsRef.current = [];
+    setAudioClips([]);
+    setActiveClipIndex(0);
+    setAudioStatus("idle");
   }
 
   return (
@@ -426,15 +503,71 @@ export function ListeningLabClient() {
             </label>
 
             <label className="block">
-              <span className="text-sm font-semibold text-neutral-700">Topic</span>
-              <input
-                value={topic}
-                onChange={(event) => setTopic(event.target.value)}
+              <span className="text-sm font-semibold text-neutral-700">
+                Audioformat
+              </span>
+              <select
+                value={format}
+                onChange={(event) => {
+                  const nextFormat = event.target
+                    .value as ListeningExercise["format"];
+                  setFormat(nextFormat);
+                  setTopic(listeningTopicSuggestions[nextFormat][0]);
+                  setCustomTopic("");
+                }}
                 disabled={status === "generating" || status === "grading"}
-                className="mt-2 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm disabled:opacity-60"
-                placeholder="travel, interview, daily life..."
-              />
+                className="mt-2 w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm disabled:opacity-60"
+              >
+                {listeningFormatOptions.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+              <span className="mt-2 block text-xs leading-5 text-neutral-500">
+                {formatDetails(format).realism}
+              </span>
             </label>
+
+            <label className="block">
+              <span className="text-sm font-semibold text-neutral-700">Topic</span>
+              <select
+                value={topic}
+                onChange={(event) => {
+                  setTopic(event.target.value);
+                  if (event.target.value !== customTopicValue) {
+                    setCustomTopic("");
+                  }
+                }}
+                disabled={status === "generating" || status === "grading"}
+                className="mt-2 w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm disabled:opacity-60"
+              >
+                {listeningTopicSuggestions[format].map((item) => (
+                  <option key={item} value={item}>
+                    {item}
+                  </option>
+                ))}
+                <option value={freshTopicValue}>
+                  AI wählt ein neues Thema
+                </option>
+                <option value={customTopicValue}>Eigenes Thema eingeben</option>
+              </select>
+            </label>
+
+            {topic === customTopicValue ? (
+              <label className="block">
+                <span className="text-sm font-semibold text-neutral-700">
+                  Eigenes Thema
+                </span>
+                <input
+                  value={customTopic}
+                  onChange={(event) => setCustomTopic(event.target.value)}
+                  disabled={status === "generating" || status === "grading"}
+                  className="mt-2 w-full rounded-md border border-neutral-300 px-3 py-2 text-sm disabled:opacity-60"
+                  placeholder={`Thema für ${formatDetails(format).label}...`}
+                />
+              </label>
+            ) : null}
 
             <label className="block">
               <span className="text-sm font-semibold text-neutral-700">
@@ -471,39 +604,27 @@ export function ListeningLabClient() {
         </section>
 
         <section className="rounded-lg border border-neutral-200 bg-white p-5">
-          <p className="text-sm font-semibold text-neutral-700">Audio format</p>
-          <div className="mt-3 space-y-2">
-            {formats.map((item) => (
-              <button
-                key={item.value}
-                type="button"
-                onClick={() => setFormat(item.value)}
-                disabled={status === "generating" || status === "grading"}
-                className={cn(
-                  "w-full rounded-md border px-3 py-3 text-left transition disabled:opacity-60",
-                  format === item.value
-                    ? "border-teal-700 bg-teal-50"
-                    : "border-neutral-200 hover:bg-neutral-50",
-                )}
-              >
-                <span className="block text-sm font-semibold">{item.label}</span>
-                <span className="mt-1 block text-xs leading-5 text-neutral-600">
-                  {item.description}
-                </span>
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="rounded-lg border border-neutral-200 bg-white p-5">
-          <p className="text-sm font-semibold text-neutral-700">Quick topics</p>
+          <p className="text-sm font-semibold text-neutral-700">
+            Vorschläge für {formatDetails(format).label}
+          </p>
+          <p className="mt-1 text-xs leading-5 text-neutral-500">
+            {formatDetails(format).description}
+          </p>
           <div className="mt-3 flex flex-wrap gap-2">
-            {starterTopics.map((item) => (
+            {listeningTopicSuggestions[format].map((item) => (
               <button
                 key={item}
                 type="button"
-                onClick={() => setTopic(item)}
-                className="rounded-full border border-neutral-200 px-3 py-1.5 text-xs font-semibold text-neutral-700 hover:border-teal-300 hover:bg-teal-50"
+                onClick={() => {
+                  setTopic(item);
+                  setCustomTopic("");
+                }}
+                className={cn(
+                  "rounded-full border px-3 py-1.5 text-xs font-semibold hover:border-teal-300 hover:bg-teal-50",
+                  topic === item
+                    ? "border-teal-500 bg-teal-50 text-teal-900"
+                    : "border-neutral-200 text-neutral-700",
+                )}
               >
                 {item}
               </button>
@@ -526,19 +647,30 @@ export function ListeningLabClient() {
               <p className="text-sm font-semibold uppercase tracking-wide text-neutral-500">
                 {exercise
                   ? `${exercise.level} ${exercise.format} (${exerciseSource})`
-                  : "Generated listening assessment"}
+                  : `${level} · ${formatDetails(format).label} · neue Aufgabe`}
               </p>
               <h2 className="mt-2 text-3xl font-semibold tracking-normal">
-                {exercise?.title || "Choose a level and generate a Hörverstehen task"}
+                {exercise?.title ||
+                  `${formatDetails(format).label}: ${
+                    topic === freshTopicValue
+                      ? "AI wählt ein frisches Thema"
+                      : topic === customTopicValue
+                        ? customTopic || "Eigenes Thema"
+                        : topic
+                  }`}
               </h2>
               <p className="mt-3 max-w-3xl text-sm leading-6 text-neutral-600">
-                {exercise?.situation ||
-                  "The German transcript stays hidden while you listen. Answer the MCQs, then unlock the transcript, explanations, skill scores, and training report."}
+                {exercise?.situation || formatDetails(format).realism}
               </p>
             </div>
-            <div className="flex items-center gap-2 rounded-md border border-neutral-200 px-3 py-2 text-sm font-semibold">
-              <Headphones className="h-4 w-4 text-teal-700" />
-              {listenCount} listens
+            <div className="flex flex-wrap justify-end gap-2">
+              <div className="rounded-md border border-teal-200 bg-teal-50 px-3 py-2 text-sm font-semibold text-teal-900">
+                Ausgewählt: {formatDetails(format).label}
+              </div>
+              <div className="flex items-center gap-2 rounded-md border border-neutral-200 px-3 py-2 text-sm font-semibold">
+                <Headphones className="h-4 w-4 text-teal-700" />
+                {listenCount} listens
+              </div>
             </div>
           </div>
 
@@ -576,17 +708,98 @@ export function ListeningLabClient() {
                   <Loader2 className="h-4 w-4 animate-spin text-teal-700" />
                   Generating the German audio...
                 </div>
-              ) : audioUrl ? (
-                <audio
-                  src={audioUrl}
-                  controls
-                  preload="metadata"
-                  controlsList="nodownload"
-                  onPlay={() => setListenCount((current) => current + 1)}
-                  className="mt-5 w-full"
-                >
-                  Your browser does not support audio playback.
-                </audio>
+              ) : audioClips.length ? (
+                <div className="mt-5 rounded-lg bg-white p-4">
+                  <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+                    <div>
+                      <p className="text-sm font-semibold text-neutral-900">
+                        {audioClips[activeClipIndex]?.speaker}
+                      </p>
+                      <p className="text-xs text-neutral-500">
+                        {audioClips[activeClipIndex]?.role} · Abschnitt{" "}
+                        {activeClipIndex + 1}/{audioClips.length}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      {Array.from(
+                        new Map(
+                          audioClips.map((clip) => [
+                            clip.speaker,
+                            { speaker: clip.speaker, role: clip.role },
+                          ]),
+                        ).values(),
+                      ).map((speaker) => (
+                        <span
+                          key={speaker.speaker}
+                          className="rounded-full border border-neutral-200 bg-neutral-50 px-2.5 py-1 text-xs font-medium text-neutral-700"
+                        >
+                          {speaker.speaker}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                  <audio
+                    ref={audioRef}
+                    src={audioClips[activeClipIndex]?.url}
+                    preload="auto"
+                    controlsList="nodownload"
+                    onPlay={() => {
+                      browserSpeechPlayback.stop();
+                      setAudioStatus("playing");
+                    }}
+                    onPause={(event) => {
+                      if (
+                        event.currentTarget.currentTime > 0 &&
+                        !event.currentTarget.ended
+                      ) {
+                        setAudioStatus("paused");
+                      }
+                    }}
+                    onEnded={handleAudioEnded}
+                    className="hidden"
+                  >
+                    Your browser does not support audio playback.
+                  </audio>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      onClick={
+                        audioStatus === "playing"
+                          ? pauseGeneratedAudio
+                          : playGeneratedAudio
+                      }
+                      className="flex items-center gap-2 rounded-md border border-neutral-300 px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
+                    >
+                      {audioStatus === "playing" ? (
+                        <>
+                          <Pause className="h-4 w-4" />
+                          Pause
+                        </>
+                      ) : (
+                        <>
+                          <Play className="h-4 w-4" />
+                          {audioStatus === "paused" ? "Resume" : "Play"}
+                        </>
+                      )}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={restartGeneratedAudio}
+                      className="flex items-center gap-2 rounded-md border border-neutral-300 px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                      Restart
+                    </button>
+                    <button
+                      type="button"
+                      onClick={stopGeneratedAudio}
+                      className="flex items-center gap-2 rounded-md border border-neutral-300 px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
+                    >
+                      <Square className="h-4 w-4" />
+                      Stop
+                    </button>
+                  </div>
+                </div>
               ) : null}
 
               {audioError ? (
@@ -595,14 +808,21 @@ export function ListeningLabClient() {
                 </div>
               ) : null}
 
-              <button
-                type="button"
-                onClick={playBrowserFallback}
-                className="mt-4 flex items-center gap-2 rounded-md border border-teal-300 bg-white px-3 py-2 text-sm font-semibold text-teal-950 hover:bg-teal-100"
-              >
-                <Play className="h-4 w-4" />
-                Play with browser voice
-              </button>
+              <SpeechPlaybackControls
+                controller={browserSpeechPlayback}
+                id={`listening-fallback-${exercise.title}`}
+                text={exercise.transcriptGerman}
+                rate={
+                  exercise.level === "A1"
+                    ? 0.78
+                    : exercise.level === "A2"
+                      ? 0.84
+                      : 0.92
+                }
+                playLabel="Play with browser voice"
+                className="mt-4"
+                onBeforePlay={stopGeneratedAudio}
+              />
             </section>
 
             <section className="space-y-4">
@@ -933,4 +1153,15 @@ function readErrorMessage(value: unknown, fallback: string) {
   }
 
   return fallback;
+}
+
+function base64ToBlob(base64: string, mimeType: string) {
+  const binary = window.atob(base64);
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return new Blob([bytes], { type: mimeType });
 }

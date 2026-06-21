@@ -25,6 +25,7 @@ export async function POST(request: Request) {
       taskTitle: body.taskTitle || "German speaking task",
       taskPrompt: body.taskPrompt || "Speak in German.",
       target: body.target,
+      conversationTranscript: body.conversationTranscript,
     });
 
     return Response.json(result);

@@ -29,6 +29,7 @@ export type SpeakingTask = {
   prompt: string;
   target?: string;
   successCriteria: string[];
+  source?: "built-in" | "generated" | "custom";
 };
 
 export type LessonSeed = {
@@ -118,9 +119,9 @@ export const speakingModes = [
   },
   {
     id: "exam",
-    title: "Exam Speaking",
+    title: "Speak on a Topic",
     icon: GraduationCap,
-    description: "Unofficial Goethe, telc, and TestDaF style speaking tasks.",
+    description: "Speak without interruption on exam-style and everyday topics.",
   },
   {
     id: "weak-spot",
@@ -150,6 +151,46 @@ export const speakingTasks: SpeakingTask[] = [
     prompt: "Introduce yourself in German for 30 seconds. Include your name, country, city, and one hobby.",
     target: "Hallo, ich heisse ... Ich komme aus ... Ich wohne in ... Mein Hobby ist ...",
     successCriteria: ["Clear vowels", "Correct verb position", "Confident personal details"],
+  },
+  {
+    id: "a1-daily-routine-pronunciation",
+    mode: "pronunciation",
+    level: "A1",
+    title: "My Daily Routine",
+    prompt: "Read the sentences clearly and keep the verbs easy to hear.",
+    target:
+      "Jeden Morgen stehe ich um sieben Uhr auf. Dann trinke ich Kaffee und fahre mit dem Bus zur Arbeit.",
+    successCriteria: ["Clear verb endings", "Long and short vowels", "Steady rhythm"],
+  },
+  {
+    id: "a2-appointment-pronunciation",
+    mode: "pronunciation",
+    level: "A2",
+    title: "Make an Appointment",
+    prompt: "Read the request politely with natural sentence stress.",
+    target:
+      "Guten Tag, ich möchte gern einen Termin vereinbaren. Hätten Sie am Donnerstagvormittag noch etwas frei?",
+    successCriteria: ["Polite intonation", "Clear umlauts", "Natural phrasing"],
+  },
+  {
+    id: "b1-experience-pronunciation",
+    mode: "pronunciation",
+    level: "B1",
+    title: "Describe an Experience",
+    prompt: "Read the short story smoothly without pausing after every word.",
+    target:
+      "Letztes Wochenende habe ich einen Ausflug gemacht, obwohl das Wetter zuerst nicht besonders gut aussah.",
+    successCriteria: ["Clause rhythm", "Clear consonants", "Connected speech"],
+  },
+  {
+    id: "b2-work-pronunciation",
+    mode: "pronunciation",
+    level: "B2",
+    title: "Professional Introduction",
+    prompt: "Read the professional introduction confidently and naturally.",
+    target:
+      "In meiner bisherigen Position war ich dafür verantwortlich, Kundenanfragen zu bearbeiten und komplexe Probleme verständlich zu erklären.",
+    successCriteria: ["Professional pacing", "Compound words", "Sentence stress"],
   },
   {
     id: "a2-cafe",
@@ -196,10 +237,34 @@ export const speakingTasks: SpeakingTask[] = [
     id: "shadow-rhythm",
     mode: "shadow",
     level: "B1",
-    title: "Shadow A Natural Sentence",
-    prompt: "Listen to the model sentence, then repeat it with the same rhythm and stress.",
-    target: "Wenn ich mehr Zeit haette, wuerde ich jeden Tag Deutsch sprechen.",
-    successCriteria: ["Subjunctive rhythm", "Stress on key words", "Smooth final clause"],
+    title: "Learning Through Daily Practice",
+    prompt:
+      "Read the entire passage naturally from beginning to end. Continue through small mistakes; feedback comes only after you finish.",
+    target:
+      "Viele Menschen möchten eine neue Sprache lernen, finden im Alltag aber nur wenig Zeit dafür. Oft glauben sie, dass eine erfolgreiche Lernstunde mindestens eine Stunde dauern muss. Tatsächlich können auch kurze, regelmäßige Einheiten sehr wirksam sein. Wer jeden Morgen zehn Minuten einen deutschen Podcast hört, auf dem Weg zur Arbeit neue Wörter wiederholt und am Abend ein paar Sätze laut spricht, begegnet der Sprache mehrmals am Tag. Entscheidend ist nicht nur die Dauer, sondern auch die Aufmerksamkeit. Es hilft, ein klares Ziel für jede Übung zu haben. An einem Tag kann man sich auf die Aussprache konzentrieren, an einem anderen auf neue Redemittel oder eine schwierige grammatische Struktur. Fehler gehören dabei zum Lernprozess. Wenn man versucht, vollkommen fehlerfrei zu sprechen, wird man oft langsamer und unsicherer. Besser ist es, eine Idee zuerst verständlich auszudrücken und sie danach gezielt zu verbessern. Mit der Zeit werden häufige Satzmuster automatisch, der Wortschatz wächst, und das Sprechen fühlt sich weniger anstrengend an. Kleine Schritte wirken vielleicht unspektakulär, führen aber langfristig zu deutlich mehr Sicherheit.",
+    successCriteria: ["Sustained rhythm", "Stress on key words", "Complete passage"],
+  },
+  {
+    id: "a2-shadow-weekend",
+    mode: "shadow",
+    level: "A2",
+    title: "A Weekend Visit",
+    prompt:
+      "Read the complete passage naturally. Continue through small mistakes; analysis comes only after you finish.",
+    target:
+      "Am letzten Wochenende habe ich meine Schwester in Köln besucht. Am Samstag sind wir früh aufgestanden und haben zusammen gefrühstückt. Danach sind wir mit der Straßenbahn in die Innenstadt gefahren. Dort haben wir zuerst den Dom besichtigt und viele Fotos gemacht. Später wollten wir am Rhein spazieren gehen, aber plötzlich hat es stark geregnet. Deshalb sind wir in ein kleines Museum gegangen. Die Ausstellung war interessant, und wir haben viel über die Geschichte der Stadt gelernt. Am Abend haben wir in einem gemütlichen Restaurant gegessen. Ich habe eine regionale Spezialität probiert, die mir sehr gut geschmeckt hat. Am Sonntag war das Wetter besser. Bevor ich nach Hause gefahren bin, haben wir noch einen langen Spaziergang gemacht. Der Besuch war kurz, aber sehr schön, und wir möchten uns bald wiedersehen.",
+    successCriteria: ["Complete passage", "Smooth sentence groups", "Clear past tense"],
+  },
+  {
+    id: "b1-shadow-workday",
+    mode: "shadow",
+    level: "B1",
+    title: "An Unexpected Workday",
+    prompt:
+      "Read the full passage at a calm, natural pace. The AI will not interrupt.",
+    target:
+      "Als ich gestern Morgen ins Büro kam, merkte ich sofort, dass etwas anders war. Normalerweise beginnen wir den Tag mit einer kurzen Besprechung, doch diesmal standen mehrere Kollegen auf dem Flur und diskutierten aufgeregt. Unser Computersystem funktionierte nicht, und niemand konnte auf wichtige Kundendaten zugreifen. Zuerst versuchten wir, das Problem selbst zu lösen. Wir starteten die Geräte neu, überprüften die Internetverbindung und riefen schließlich den technischen Support an. Während wir warteten, verteilte unsere Teamleiterin andere Aufgaben. Einige Kollegen beantworteten telefonische Anfragen, andere bereiteten Unterlagen für die nächsten Tage vor. Nach ungefähr zwei Stunden lief das System wieder. Obwohl der Vormittag chaotisch gewesen war, hatten wir als Team gut zusammengearbeitet. Am Ende des Tages waren fast alle Aufgaben erledigt, und wir wussten, wie wir bei einem ähnlichen Problem schneller reagieren könnten.",
+    successCriteria: ["Sustained rhythm", "Natural clause stress", "Clear word endings"],
   },
 ];
 

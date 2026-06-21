@@ -1,3 +1,5 @@
+import { buildRealtimeSpeakingSession } from "@/lib/realtime-speaking-config";
+
 export const runtime = "nodejs";
 
 type RealtimeTokenRequest = {
@@ -22,43 +24,16 @@ export async function POST(request: Request) {
 
   const body = (await request.json().catch(() => ({}))) as RealtimeTokenRequest;
 
-  const sessionConfig = {
-    session: {
-      type: "realtime",
-      model: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime",
-      instructions: [
-        "You are DeutschPilot AI, a German speaking coach.",
-        "Listen to the learner, transcribe German speech, and keep the spoken response brief.",
-        "Encourage the learner to finish the attempt before detailed scoring.",
-        `Mode: ${body.mode || "speaking-practice"}.`,
-        `Target CEFR level: ${body.level || "A1"}.`,
-        `Task: ${body.taskTitle || "German speaking practice"} - ${
-          body.taskPrompt || "Speak naturally in German."
-        }`,
-      ].join("\n"),
-      audio: {
-        input: {
-          noise_reduction: { type: "near_field" },
-          transcription: {
-            model: process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe",
-            language: "de",
-            prompt:
-              "German learner speech. Preserve German words, hesitations, and obvious learner mistakes.",
-          },
-          turn_detection: {
-            type: "server_vad",
-            threshold: 0.45,
-            prefix_padding_ms: 300,
-            silence_duration_ms: 650,
-          },
-        },
-        output: {
-          voice: process.env.OPENAI_REALTIME_VOICE || "marin",
-        },
-      },
-      include: ["item.input_audio_transcription.logprobs"],
-    },
-  };
+  const sessionConfig = buildRealtimeSpeakingSession({
+    mode: body.mode || "pronunciation",
+    level: body.level || "A1",
+    taskTitle: body.taskTitle || "German speaking practice",
+    taskPrompt: body.taskPrompt || "Speak naturally in German.",
+    model: process.env.OPENAI_REALTIME_MODEL || "gpt-realtime",
+    voice: process.env.OPENAI_REALTIME_VOICE || "marin",
+    transcriptionModel:
+      process.env.OPENAI_TRANSCRIPTION_MODEL || "gpt-4o-transcribe",
+  });
 
   const response = await fetch("https://api.openai.com/v1/realtime/client_secrets", {
     method: "POST",

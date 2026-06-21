@@ -7,12 +7,11 @@ import {
   Loader2,
   Mic,
   MicOff,
-  Play,
+  Plus,
   RotateCcw,
   Save,
   Sparkles,
   Upload,
-  Volume2,
 } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
@@ -24,7 +23,22 @@ import {
   type SpeakingMode,
   type SpeakingTask,
 } from "@/lib/curriculum";
+import { SpeechPlaybackControls } from "@/components/audio/speech-playback-controls";
+import { useSpeechPlayback } from "@/hooks/use-speech-playback";
+import { convertRecordingToWav } from "@/lib/audio-recording";
 import type { SpeechFeedback } from "@/lib/ai/schemas";
+import type { SpeakingPracticeTask } from "@/lib/speaking-task-model";
+import { getSpeakingModeBehavior } from "@/lib/realtime-speaking-config";
+import {
+  applyTranscriptUpdate,
+  compareAttemptScores,
+  conversationTranscript,
+  learnerTranscript,
+  readRealtimeTranscriptUpdate,
+  roleplayIsComplete,
+  setTurnTranslation,
+  type TranscriptTurn,
+} from "@/lib/speaking-session";
 import { cn } from "@/lib/utils";
 
 type LiveStatus =
@@ -41,23 +55,40 @@ type RealtimeSession = {
   dc: RTCDataChannel;
   stream: MediaStream;
   audioElement: HTMLAudioElement;
+  recorder: MediaRecorder | null;
+  recordedChunks: Blob[];
 };
 
 type FeedbackResponse = {
   transcript?: string;
   feedback: SpeechFeedback;
   source: "openai" | "demo";
+  analysisBasis?: "audio" | "transcript";
+  audioWarning?: string;
 };
 
 type Attempt = {
   id: string;
+  taskId: string;
   taskTitle: string;
   transcript: string;
-  score: number;
+  fluencyScore: number;
+  taskCompletionScore: number;
   cefr: string;
 };
 
+type AttemptComparison = NonNullable<
+  ReturnType<typeof compareAttemptScores>
+>;
+
 type SaveStatus = "idle" | "saving" | "saved" | "error";
+type TaskActionStatus = "idle" | "loading" | "saving";
+type RoleplayPhase =
+  | "idle"
+  | "ai-speaking"
+  | "user-speaking"
+  | "waiting"
+  | "complete";
 
 const maxAudioUploadBytes = 8 * 1024 * 1024;
 const allowedAudioExtensions = [".webm", ".mp3", ".m4a", ".wav", ".ogg", ".mp4"];
@@ -77,9 +108,7 @@ export function SpeakingLabClient() {
   const [selectedLevel, setSelectedLevel] = useState<CefrLevel>("A1");
   const [selectedTaskId, setSelectedTaskId] = useState("a1-intro");
   const [status, setStatus] = useState<LiveStatus>("idle");
-  const [transcript, setTranscriptState] = useState("");
-  const [liveTranscript, setLiveTranscript] = useState("");
-  const [manualTranscript, setManualTranscript] = useState("");
+  const [transcriptTurns, setTranscriptTurns] = useState<TranscriptTurn[]>([]);
   const [feedback, setFeedback] = useState<SpeechFeedback | null>(null);
   const [feedbackSource, setFeedbackSource] = useState<"openai" | "demo" | null>(null);
   const [error, setError] = useState("");
@@ -87,14 +116,40 @@ export function SpeakingLabClient() {
   const [liveSessionActive, setLiveSessionActive] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>("idle");
   const [saveMessage, setSaveMessage] = useState("");
+  const [savedTasks, setSavedTasks] = useState<SpeakingPracticeTask[]>([]);
+  const [taskActionStatus, setTaskActionStatus] =
+    useState<TaskActionStatus>("idle");
+  const [customTaskTitle, setCustomTaskTitle] = useState("");
+  const [customTaskText, setCustomTaskText] = useState("");
+  const [roleplayPhase, setRoleplayPhase] = useState<RoleplayPhase>("idle");
+  const [roleplayUserChunks, setRoleplayUserChunks] = useState(0);
+  const [feedbackBasis, setFeedbackBasis] = useState<
+    "audio" | "transcript" | null
+  >(null);
+  const [feedbackWarning, setFeedbackWarning] = useState("");
+  const [attemptComparison, setAttemptComparison] =
+    useState<AttemptComparison | null>(null);
 
   const sessionRef = useRef<RealtimeSession | null>(null);
-  const transcriptRef = useRef("");
-  const liveTranscriptRef = useRef("");
+  const transcriptTurnsRef = useRef<TranscriptTurn[]>([]);
   const intentionalCloseRef = useRef(false);
+  const pendingRoleplayResponseRef = useRef(false);
+  const roleplayUserChunksRef = useRef(0);
+  const roleplayAssistantRepliesRef = useRef(0);
+  const roleplaySpeechActiveRef = useRef(false);
+  const attemptsRef = useRef<Attempt[]>([]);
+  const speechPlayback = useSpeechPlayback({ rate: 0.86 });
+
+  const allSpeakingTasks = useMemo(
+    () => [
+      ...speakingTasks.map((task) => ({ ...task, source: "built-in" as const })),
+      ...savedTasks,
+    ],
+    [savedTasks],
+  );
 
   const visibleTasks = useMemo(() => {
-    const exact = speakingTasks.filter(
+    const exact = allSpeakingTasks.filter(
       (task) => task.mode === selectedMode && task.level === selectedLevel,
     );
 
@@ -102,52 +157,149 @@ export function SpeakingLabClient() {
       return exact;
     }
 
-    return speakingTasks.filter((task) => task.mode === selectedMode);
-  }, [selectedLevel, selectedMode]);
+    return allSpeakingTasks.filter((task) => task.mode === selectedMode);
+  }, [allSpeakingTasks, selectedLevel, selectedMode]);
 
-  const activeTask: SpeakingTask =
+  const activeTask: SpeakingTask | SpeakingPracticeTask =
     visibleTasks.find((task) => task.id === selectedTaskId) ||
     visibleTasks[0] ||
     speakingTasks[0];
+  const modelSentence = activeTask.target || activeTask.prompt;
+  const retrySentence = feedback?.retryPrompt || modelSentence;
+  const modeBehavior = getSpeakingModeBehavior(selectedMode);
+
+  useEffect(() => {
+    void loadSavedTasks();
+  }, []);
 
   useEffect(() => {
     return () => {
       closeRealtimeSession();
-      window.speechSynthesis?.cancel();
     };
   }, []);
 
-  function setTranscript(value: string) {
-    transcriptRef.current = value;
-    setTranscriptState(value);
+  async function loadSavedTasks() {
+    try {
+      const response = await fetch("/api/speaking-tasks");
+      const data = (await response.json()) as {
+        tasks?: SpeakingPracticeTask[];
+      };
+      if (response.ok && Array.isArray(data.tasks)) {
+        setSavedTasks(data.tasks);
+      }
+    } catch {
+      // Built-in tasks remain available if persisted tasks cannot be loaded.
+    }
   }
 
-  function setLiveTranscriptValue(value: string) {
-    liveTranscriptRef.current = value;
-    setLiveTranscript(value);
-  }
-
-  function addTranscriptTurn(turn: string) {
-    const cleanTurn = turn.trim();
-
-    if (!cleanTurn) {
+  async function createSpeakingTask(action: "generate" | "custom") {
+    if (action === "custom" && !customTaskText.trim()) {
+      setError("Enter German text or a speaking prompt before saving your task.");
       return;
     }
 
-    setTranscript([transcriptRef.current, cleanTurn].filter(Boolean).join(" "));
+    setError("");
+    setTaskActionStatus(action === "generate" ? "loading" : "saving");
+
+    try {
+      const response = await fetch("/api/speaking-tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action,
+          mode: selectedMode,
+          level: selectedLevel,
+          title: customTaskTitle,
+          text: customTaskText,
+          existingTitles: visibleTasks.map((task) => task.title),
+        }),
+      });
+      const data = (await response.json()) as {
+        task?: SpeakingPracticeTask;
+        error?: string;
+      };
+
+      if (!response.ok || !data.task) {
+        throw new Error(data.error || "Speaking task creation failed.");
+      }
+
+      setSavedTasks((current) => [
+        data.task!,
+        ...current.filter((task) => task.id !== data.task!.id),
+      ]);
+      setSelectedTaskId(data.task.id);
+      setFeedback(null);
+      setCustomTaskTitle("");
+      setCustomTaskText("");
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "Speaking task creation failed.",
+      );
+    } finally {
+      setTaskActionStatus("idle");
+    }
+  }
+
+  function updateTranscriptTurns(
+    updater: (current: TranscriptTurn[]) => TranscriptTurn[],
+  ) {
+    const next = updater(transcriptTurnsRef.current);
+    transcriptTurnsRef.current = next;
+    setTranscriptTurns(next);
+  }
+
+  async function translateTranscriptTurn(itemId: string, german: string) {
+    try {
+      const response = await fetch("/api/ai/speaking-translate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: german }),
+      });
+      const data = (await response.json()) as {
+        translation?: string;
+        error?: string;
+      };
+
+      if (!response.ok || !data.translation) {
+        throw new Error(data.error || "Translation failed.");
+      }
+
+      updateTranscriptTurns((current) =>
+        setTurnTranslation(current, itemId, data.translation || ""),
+      );
+    } catch {
+      updateTranscriptTurns((current) =>
+        setTurnTranslation(
+          current,
+          itemId,
+          "English translation could not be generated.",
+          true,
+        ),
+      );
+    }
   }
 
   async function startLiveSession() {
     closeRealtimeSession();
-    window.speechSynthesis?.cancel();
+    speechPlayback.stop();
     setError("");
     setFeedback(null);
     setFeedbackSource(null);
-    setTranscript("");
-    setLiveTranscriptValue("");
-    setManualTranscript("");
+    setFeedbackBasis(null);
+    setFeedbackWarning("");
+    setAttemptComparison(null);
+    transcriptTurnsRef.current = [];
+    setTranscriptTurns([]);
     setSaveStatus("idle");
     setSaveMessage("");
+    setRoleplayPhase(selectedMode === "roleplay" ? "ai-speaking" : "idle");
+    roleplayUserChunksRef.current = 0;
+    roleplayAssistantRepliesRef.current = 0;
+    roleplaySpeechActiveRef.current = false;
+    pendingRoleplayResponseRef.current = false;
+    setRoleplayUserChunks(0);
     setStatus("connecting");
 
     if (!navigator.mediaDevices?.getUserMedia) {
@@ -193,6 +345,8 @@ export function SpeakingLabClient() {
           autoGainControl: true,
         },
       });
+      const recordedChunks: Blob[] = [];
+      const recorder = createSessionRecorder(stream, recordedChunks);
 
       stream.getTracks().forEach((track) => pc.addTrack(track, stream));
 
@@ -200,7 +354,7 @@ export function SpeakingLabClient() {
       dc.addEventListener("message", handleRealtimeMessage);
       dc.addEventListener("error", () => {
         if (!intentionalCloseRef.current) {
-          setError("The live voice connection was interrupted. Use audio upload or transcript fallback.");
+          setError("The live voice connection was interrupted. Use audio upload instead.");
           setStatus("error");
         }
         closeRealtimeSession();
@@ -222,9 +376,21 @@ export function SpeakingLabClient() {
             },
           }),
         );
+        if (selectedMode === "roleplay") {
+          setMicrophoneEnabled(false);
+          requestRoleplayResponse();
+        }
       });
 
-      sessionRef.current = { pc, dc, stream, audioElement };
+      sessionRef.current = {
+        pc,
+        dc,
+        stream,
+        audioElement,
+        recorder,
+        recordedChunks,
+      };
+      recorder?.start(1000);
       setLiveSessionActive(true);
       pc.addEventListener("connectionstatechange", () => {
         if (
@@ -274,13 +440,26 @@ export function SpeakingLabClient() {
   }
 
   async function stopAndAnalyze() {
-    const combinedTranscript = [transcriptRef.current, liveTranscriptRef.current]
-      .filter(Boolean)
-      .join(" ")
-      .trim();
+    const combinedTranscript = learnerTranscript(transcriptTurnsRef.current);
+    const session = sessionRef.current;
+    let recording: File | null = null;
+
+    try {
+      recording = await stopSessionRecording(session);
+    } catch (caughtError) {
+      setFeedbackWarning(
+        caughtError instanceof Error
+          ? caughtError.message
+          : "The microphone recording could not be prepared for audio analysis.",
+      );
+    }
 
     closeRealtimeSession();
-    setLiveTranscriptValue("");
+
+    if (recording) {
+      await analyzeAudioFile(recording, false);
+      return;
+    }
 
     await analyzeTranscript(combinedTranscript);
   }
@@ -289,14 +468,15 @@ export function SpeakingLabClient() {
     const cleanTranscript = rawTranscript.trim();
 
     if (!cleanTranscript) {
-      setError("Speak, upload audio, or paste a transcript before analysis.");
+      setError("Speak live or upload an audio recording before analysis.");
       setStatus("error");
       return;
     }
 
     setError("");
     setStatus("processing");
-    setTranscript(cleanTranscript);
+    setFeedbackBasis(null);
+    setFeedbackWarning("");
 
     try {
       const response = await fetch("/api/ai/speech-feedback", {
@@ -309,6 +489,9 @@ export function SpeakingLabClient() {
           taskTitle: activeTask.title,
           taskPrompt: activeTask.prompt,
           target: activeTask.target,
+          conversationTranscript: conversationTranscript(
+            transcriptTurnsRef.current,
+          ),
         }),
       });
 
@@ -320,9 +503,10 @@ export function SpeakingLabClient() {
 
       setFeedback(data.feedback);
       setFeedbackSource(data.source);
+      setFeedbackBasis("transcript");
       setStatus("feedback");
       registerAttempt(cleanTranscript, data.feedback);
-      await persistAttempt(cleanTranscript, data.feedback);
+      await persistAttempt(cleanTranscript, data.feedback, "transcript");
     } catch (caughtError) {
       setError(
         caughtError instanceof Error
@@ -358,8 +542,14 @@ export function SpeakingLabClient() {
     }
 
     closeRealtimeSession();
+    await analyzeAudioFile(file, true);
+  }
+
+  async function analyzeAudioFile(file: File, replaceTranscript: boolean) {
     setError("");
     setFeedback(null);
+    setFeedbackBasis(null);
+    setFeedbackWarning("");
     setSaveStatus("idle");
     setSaveMessage("");
     setStatus("processing");
@@ -371,27 +561,52 @@ export function SpeakingLabClient() {
     formData.append("taskTitle", activeTask.title);
     formData.append("taskPrompt", activeTask.prompt);
     formData.append("target", activeTask.target || "");
+    formData.append(
+      "conversationTranscript",
+      conversationTranscript(transcriptTurnsRef.current),
+    );
 
     try {
       const response = await fetch("/api/ai/transcribe-upload", {
         method: "POST",
         body: formData,
       });
-
-      const data = (await response.json()) as FeedbackResponse | { error?: string };
+      const data = (await response.json()) as
+        | FeedbackResponse
+        | { error?: string };
 
       if (!response.ok || !("feedback" in data)) {
         throw new Error(readErrorMessage(data, "Audio upload analysis failed."));
       }
 
       const uploadedTranscript = data.transcript || "";
-      setTranscript(uploadedTranscript);
-      setManualTranscript(uploadedTranscript);
+
+      if (replaceTranscript || !transcriptTurnsRef.current.length) {
+        const itemId = crypto.randomUUID();
+        const uploadedTurn: TranscriptTurn = {
+          id: itemId,
+          role: "user",
+          german: uploadedTranscript,
+          english: "",
+          translationStatus: "loading",
+          complete: true,
+        };
+        transcriptTurnsRef.current = [uploadedTurn];
+        setTranscriptTurns([uploadedTurn]);
+        void translateTranscriptTurn(itemId, uploadedTranscript);
+      }
+
       setFeedback(data.feedback);
       setFeedbackSource(data.source);
+      setFeedbackBasis(data.analysisBasis || "transcript");
+      setFeedbackWarning(data.audioWarning || "");
       setStatus("feedback");
       registerAttempt(uploadedTranscript, data.feedback);
-      await persistAttempt(uploadedTranscript, data.feedback);
+      await persistAttempt(
+        uploadedTranscript,
+        data.feedback,
+        data.analysisBasis || "transcript",
+      );
     } catch (caughtError) {
       setError(
         caughtError instanceof Error
@@ -405,28 +620,70 @@ export function SpeakingLabClient() {
   function handleRealtimeMessage(message: MessageEvent<string>) {
     try {
       const event = JSON.parse(message.data) as Record<string, unknown>;
-      const type = typeof event.type === "string" ? event.type : "";
+      const update = readRealtimeTranscriptUpdate(event);
 
-      if (type === "input_audio_buffer.speech_started") {
+      if (!update) {
+        return;
+      }
+
+      if (update.kind === "speech-started") {
+        roleplaySpeechActiveRef.current = true;
         setStatus("speech");
+        return;
       }
 
-      if (type === "input_audio_buffer.speech_stopped") {
+      if (update.kind === "speech-stopped") {
+        roleplaySpeechActiveRef.current = false;
         setStatus("listening");
+        return;
       }
 
-      if (type === "conversation.item.input_audio_transcription.delta") {
-        const delta = typeof event.delta === "string" ? event.delta : "";
-        setLiveTranscriptValue(`${liveTranscriptRef.current}${delta}`);
+      if (update.kind === "error") {
+        setError(update.message);
+        setStatus("error");
+        return;
       }
 
-      if (type === "conversation.item.input_audio_transcription.completed") {
-        const completed =
-          typeof event.transcript === "string"
-            ? event.transcript
-            : liveTranscriptRef.current;
-        addTranscriptTurn(completed);
-        setLiveTranscriptValue("");
+      if (update.kind === "transcript") {
+        updateTranscriptTurns((current) => applyTranscriptUpdate(current, update));
+        if (update.complete && update.text.trim()) {
+          void translateTranscriptTurn(update.itemId, update.text);
+          if (selectedMode === "roleplay" && update.role === "user") {
+            roleplayUserChunksRef.current += 1;
+            setRoleplayUserChunks(roleplayUserChunksRef.current);
+            if (pendingRoleplayResponseRef.current) {
+              requestRoleplayResponse();
+            }
+          }
+        }
+        return;
+      }
+
+      if (update.kind === "response-started" && selectedMode === "roleplay") {
+        setRoleplayPhase("ai-speaking");
+        setMicrophoneEnabled(false);
+        return;
+      }
+
+      if (update.kind === "response-done" && selectedMode === "roleplay") {
+        roleplayAssistantRepliesRef.current += 1;
+        pendingRoleplayResponseRef.current = false;
+
+        if (
+          roleplayIsComplete(
+            transcriptTurnsRef.current,
+            roleplayAssistantRepliesRef.current,
+          )
+        ) {
+          setRoleplayPhase("complete");
+          setMicrophoneEnabled(false);
+        } else {
+          roleplayUserChunksRef.current = 0;
+          setRoleplayUserChunks(0);
+          setRoleplayPhase("user-speaking");
+          setMicrophoneEnabled(true);
+          setStatus("listening");
+        }
       }
     } catch {
       // Realtime emits many events; unknown payloads are safely ignored.
@@ -444,6 +701,9 @@ export function SpeakingLabClient() {
     intentionalCloseRef.current = true;
     sessionRef.current = null;
     setLiveSessionActive(false);
+    if (session.recorder && session.recorder.state !== "inactive") {
+      session.recorder.stop();
+    }
     session.stream.getTracks().forEach((track) => track.stop());
     if (session.dc.readyState !== "closed") {
       session.dc.close();
@@ -457,35 +717,111 @@ export function SpeakingLabClient() {
     });
   }
 
-  function playModelSentence() {
-    const sentence = feedback?.retryPrompt || activeTask.target || activeTask.prompt;
+  async function stopSessionRecording(session: RealtimeSession | null) {
+    if (!session?.recorder) {
+      return null;
+    }
 
-    if (!("speechSynthesis" in window)) {
-      setError("Text-to-speech is not available in this browser.");
+    if (session.recorder.state !== "inactive") {
+      await new Promise<void>((resolve) => {
+        session.recorder!.addEventListener("stop", () => resolve(), {
+          once: true,
+        });
+        session.recorder!.stop();
+      });
+    }
+
+    if (!session.recordedChunks.length) {
+      return null;
+    }
+
+    const recording = new Blob(session.recordedChunks, {
+      type: session.recorder.mimeType || "audio/webm",
+    });
+    return convertRecordingToWav(recording);
+  }
+
+  function setMicrophoneEnabled(enabled: boolean) {
+    sessionRef.current?.stream.getAudioTracks().forEach((track) => {
+      track.enabled = enabled;
+    });
+  }
+
+  function requestRoleplayResponse() {
+    const session = sessionRef.current;
+
+    if (!session || session.dc.readyState !== "open") {
       return;
     }
 
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(sentence);
-    utterance.lang = "de-DE";
-    utterance.rate = 0.86;
-    window.speechSynthesis.speak(utterance);
+    pendingRoleplayResponseRef.current = false;
+    roleplayUserChunksRef.current = 0;
+    setRoleplayUserChunks(0);
+    setMicrophoneEnabled(false);
+    setRoleplayPhase("ai-speaking");
+    session.dc.send(
+      JSON.stringify({
+        type: "response.create",
+        response:
+          roleplayAssistantRepliesRef.current >= 5
+            ? {
+                instructions:
+                  'End the roleplay now. Say exactly: "Die Aufgabe ist abgeschlossen. Klicke jetzt auf Analysieren."',
+              }
+            : undefined,
+      }),
+    );
+  }
+
+  function finishRoleplayTurn() {
+    if (
+      selectedMode !== "roleplay" ||
+      roleplayPhase !== "user-speaking" ||
+      roleplayUserChunksRef.current < 1
+    ) {
+      return;
+    }
+
+    setMicrophoneEnabled(false);
+    setRoleplayPhase("waiting");
+
+    if (roleplaySpeechActiveRef.current) {
+      pendingRoleplayResponseRef.current = true;
+      return;
+    }
+
+    requestRoleplayResponse();
   }
 
   function registerAttempt(rawTranscript: string, result: SpeechFeedback) {
-    setAttempts((current) => [
-      {
-        id: crypto.randomUUID(),
-        taskTitle: activeTask.title,
-        transcript: rawTranscript,
-        score: result.fluencyScore,
-        cefr: result.cefrLevel,
-      },
-      ...current,
-    ]);
+    const previous =
+      attemptsRef.current.find((attempt) => attempt.taskId === activeTask.id) ||
+      null;
+    const nextAttempt: Attempt = {
+      id: crypto.randomUUID(),
+      taskId: activeTask.id,
+      taskTitle: activeTask.title,
+      transcript: rawTranscript,
+      fluencyScore: result.fluencyScore,
+      taskCompletionScore: result.taskCompletionScore,
+      cefr: result.cefrLevel,
+    };
+    const next = [nextAttempt, ...attemptsRef.current];
+    attemptsRef.current = next;
+    setAttempts(next);
+    setAttemptComparison(
+      compareAttemptScores(previous, {
+        fluencyScore: result.fluencyScore,
+        taskCompletionScore: result.taskCompletionScore,
+      }),
+    );
   }
 
-  async function persistAttempt(rawTranscript: string, result: SpeechFeedback) {
+  async function persistAttempt(
+    rawTranscript: string,
+    result: SpeechFeedback,
+    analysisBasis: "audio" | "transcript",
+  ) {
     setSaveStatus("saving");
     setSaveMessage("Saving transcript, scores, and weak tags...");
 
@@ -500,6 +836,8 @@ export function SpeakingLabClient() {
           taskPrompt: activeTask.prompt,
           transcript: rawTranscript,
           feedback: result,
+          analysisBasis,
+          transcriptTurns: transcriptTurnsRef.current,
         }),
       });
       const data = (await response.json()) as {
@@ -521,6 +859,28 @@ export function SpeakingLabClient() {
           : "Speaking attempt could not be saved.",
       );
     }
+  }
+
+  function prepareRetake() {
+    closeRealtimeSession();
+    speechPlayback.stop();
+    transcriptTurnsRef.current = [];
+    setTranscriptTurns([]);
+    setFeedback(null);
+    setFeedbackSource(null);
+    setFeedbackBasis(null);
+    setFeedbackWarning("");
+    setAttemptComparison(null);
+    setError("");
+    setSaveStatus("idle");
+    setSaveMessage("");
+    setRoleplayPhase("idle");
+    roleplayUserChunksRef.current = 0;
+    roleplayAssistantRepliesRef.current = 0;
+    roleplaySpeechActiveRef.current = false;
+    pendingRoleplayResponseRef.current = false;
+    setRoleplayUserChunks(0);
+    setStatus("idle");
   }
 
   return (
@@ -551,12 +911,13 @@ export function SpeakingLabClient() {
                   key={mode.id}
                   type="button"
                   onClick={() => {
+                    speechPlayback.stop();
                     setSelectedMode(mode.id);
-                    const nextTasks = speakingTasks.filter(
+                    const nextTasks = allSpeakingTasks.filter(
                       (task) =>
                         task.mode === mode.id && task.level === selectedLevel,
                     );
-                    const fallbackTasks = speakingTasks.filter(
+                    const fallbackTasks = allSpeakingTasks.filter(
                       (task) => task.mode === mode.id,
                     );
                     setSelectedTaskId(
@@ -564,6 +925,7 @@ export function SpeakingLabClient() {
                     );
                     setFeedback(null);
                     setError("");
+                    setRoleplayPhase("idle");
                   }}
                   disabled={
                     liveSessionActive ||
@@ -595,13 +957,14 @@ export function SpeakingLabClient() {
                 <select
                   value={selectedLevel}
                   onChange={(event) => {
+                    speechPlayback.stop();
                     const nextLevel = event.target.value as CefrLevel;
                     setSelectedLevel(nextLevel);
-                    const nextTasks = speakingTasks.filter(
+                    const nextTasks = allSpeakingTasks.filter(
                       (task) =>
                         task.mode === selectedMode && task.level === nextLevel,
                     );
-                    const fallbackTasks = speakingTasks.filter(
+                    const fallbackTasks = allSpeakingTasks.filter(
                       (task) => task.mode === selectedMode,
                     );
                     setSelectedTaskId(
@@ -630,6 +993,7 @@ export function SpeakingLabClient() {
                 <select
                   value={activeTask.id}
                   onChange={(event) => {
+                    speechPlayback.stop();
                     setSelectedTaskId(event.target.value);
                     setFeedback(null);
                     setError("");
@@ -648,10 +1012,79 @@ export function SpeakingLabClient() {
                   ))}
                 </select>
               </label>
+
+              <div className="rounded-lg border border-neutral-200 bg-neutral-50 p-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-neutral-800">
+                      Your task library
+                    </p>
+                    <p className="mt-1 text-xs leading-5 text-neutral-600">
+                      Generated and custom tasks are saved to your account.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void createSpeakingTask("generate")}
+                    disabled={
+                      taskActionStatus !== "idle" ||
+                      liveSessionActive ||
+                      status === "processing"
+                    }
+                    className="flex shrink-0 items-center gap-2 rounded-md border border-teal-700 bg-white px-3 py-2 text-xs font-semibold text-teal-800 hover:bg-teal-50 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {taskActionStatus === "loading" ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-3.5 w-3.5" />
+                    )}
+                    Generate
+                  </button>
+                </div>
+
+                <input
+                  value={customTaskTitle}
+                  onChange={(event) => setCustomTaskTitle(event.target.value)}
+                  disabled={taskActionStatus !== "idle" || liveSessionActive}
+                  placeholder="Optional task title"
+                  className="mt-3 w-full rounded-md border border-neutral-300 bg-white px-3 py-2 text-xs"
+                />
+                <textarea
+                  value={customTaskText}
+                  onChange={(event) => setCustomTaskText(event.target.value)}
+                  disabled={taskActionStatus !== "idle" || liveSessionActive}
+                  placeholder={customTaskPlaceholder(selectedMode)}
+                  className="mt-2 min-h-24 w-full resize-y rounded-md border border-neutral-300 bg-white px-3 py-2 text-xs leading-5"
+                />
+                <button
+                  type="button"
+                  onClick={() => void createSpeakingTask("custom")}
+                  disabled={
+                    taskActionStatus !== "idle" ||
+                    liveSessionActive ||
+                    !customTaskText.trim()
+                  }
+                  className="mt-2 flex w-full items-center justify-center gap-2 rounded-md bg-neutral-900 px-3 py-2 text-xs font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {taskActionStatus === "saving" ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Plus className="h-3.5 w-3.5" />
+                  )}
+                  Save my task
+                </button>
+              </div>
             </div>
 
             <div className="mt-5 rounded-lg border border-neutral-200 bg-neutral-50 p-4">
-              <p className="text-sm font-semibold text-neutral-800">{activeTask.title}</p>
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-sm font-semibold text-neutral-800">
+                  {activeTask.title}
+                </p>
+                <span className="rounded-full bg-white px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-neutral-500">
+                  {activeTask.source || "built-in"}
+                </span>
+              </div>
               <p className="mt-2 text-sm leading-6 text-neutral-700">{activeTask.prompt}</p>
               {activeTask.target ? (
                 <p className="mt-3 rounded-md bg-white p-3 text-sm font-medium text-neutral-900">
@@ -670,14 +1103,13 @@ export function SpeakingLabClient() {
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={playModelSentence}
-              className="mt-4 flex w-full items-center justify-center gap-2 rounded-md border border-neutral-300 bg-white px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
-            >
-              <Volume2 className="h-4 w-4" />
-              Play model line
-            </button>
+            <SpeechPlaybackControls
+              controller={speechPlayback}
+              id={`speaking-model-${activeTask.id}`}
+              text={modelSentence}
+              playLabel="Play model line"
+              className="mt-4"
+            />
           </div>
 
           <div className="rounded-lg border border-neutral-200 bg-white p-5">
@@ -697,7 +1129,7 @@ export function SpeakingLabClient() {
                 ) : (
                   <Mic className="h-4 w-4" />
                 )}
-                Start live mic
+                {modeBehavior.startLabel}
               </button>
               <button
                 type="button"
@@ -706,20 +1138,37 @@ export function SpeakingLabClient() {
                 className="flex items-center gap-2 rounded-md border border-neutral-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <MicOff className="h-4 w-4" />
-                Stop and analyze
+                {modeBehavior.stopLabel}
               </button>
+              {selectedMode === "roleplay" ? (
+                <button
+                  type="button"
+                  onClick={finishRoleplayTurn}
+                  disabled={
+                    !liveSessionActive ||
+                    roleplayPhase !== "user-speaking" ||
+                    roleplayUserChunks < 1
+                  }
+                  className="flex items-center gap-2 rounded-md bg-neutral-900 px-4 py-2 text-sm font-semibold text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <MicOff className="h-4 w-4" />
+                  I&apos;m done speaking
+                </button>
+              ) : null}
               <button
                 type="button"
-                onClick={() => analyzeTranscript(manualTranscript || transcript)}
+                onClick={() =>
+                  analyzeTranscript(learnerTranscript(transcriptTurnsRef.current))
+                }
                 disabled={
                   status === "processing" ||
                   status === "connecting" ||
-                  !(manualTranscript.trim() || transcript.trim())
+                  !learnerTranscript(transcriptTurns).trim()
                 }
                 className="flex items-center gap-2 rounded-md border border-neutral-300 bg-white px-4 py-2 text-sm font-semibold hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <Sparkles className="h-4 w-4" />
-                Analyze transcript
+                Analyze captured speech
               </button>
               <label
                 className={cn(
@@ -751,41 +1200,80 @@ export function SpeakingLabClient() {
               </div>
             ) : null}
 
+            {selectedMode === "roleplay" && liveSessionActive ? (
+              <div
+                className={cn(
+                  "mt-4 rounded-lg border p-3 text-sm",
+                  roleplayPhase === "complete"
+                    ? "border-teal-200 bg-teal-50 text-teal-950"
+                    : "border-neutral-200 bg-neutral-50 text-neutral-700",
+                )}
+              >
+                {roleplayPhase === "ai-speaking"
+                  ? "AI is replying. Your microphone is paused until the reply finishes."
+                  : roleplayPhase === "waiting"
+                    ? "Finishing your turn before the AI replies..."
+                    : roleplayPhase === "complete"
+                      ? "The roleplay is complete. Click End and analyze for your feedback."
+                      : "Speak naturally. The AI waits until you click “I’m done speaking.”"}
+              </div>
+            ) : null}
+
             <div className="mt-5 grid gap-4 lg:grid-cols-2">
               <div>
                 <div className="mb-2 flex items-center justify-between">
-                  <p className="text-sm font-semibold text-neutral-800">Live transcript</p>
+                  <p className="text-sm font-semibold text-neutral-800">
+                    Live German transcript
+                  </p>
                   {status === "processing" ? (
                     <Loader2 className="h-4 w-4 animate-spin text-teal-700" />
                   ) : null}
                 </div>
-                <div className="min-h-52 rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm leading-6 text-neutral-800">
-                  {transcript || liveTranscript ? (
-                    <>
-                      {transcript}
-                      {liveTranscript ? (
-                        <span className="text-teal-800"> {liveTranscript}</span>
-                      ) : null}
-                    </>
+                <div className="min-h-52 space-y-3 rounded-lg border border-neutral-200 bg-neutral-50 p-4 text-sm leading-6 text-neutral-800">
+                  {transcriptTurns.length ? (
+                    transcriptTurns.map((turn) => (
+                      <TranscriptBubble
+                        key={turn.id}
+                        label={turn.role === "user" ? "User" : "AI"}
+                        value={turn.german}
+                        active={!turn.complete}
+                      />
+                    ))
                   ) : (
                     <span className="text-neutral-500">
-                      Your German transcript will appear here.
+                      User and AI German turns will appear here.
                     </span>
                   )}
                 </div>
               </div>
 
-              <label className="block">
-                <span className="mb-2 block text-sm font-semibold text-neutral-800">
-                  Paste transcript fallback
-                </span>
-                <textarea
-                  value={manualTranscript}
-                  onChange={(event) => setManualTranscript(event.target.value)}
-                  className="min-h-52 w-full resize-none rounded-lg border border-neutral-200 bg-white p-4 text-sm leading-6"
-                  placeholder="Ich heisse Alex und ich wohne in Berlin..."
-                />
-              </label>
+              <div>
+                <p className="mb-2 text-sm font-semibold text-neutral-800">
+                  English transcript
+                </p>
+                <div className="min-h-52 space-y-3 rounded-lg border border-neutral-200 bg-white p-4 text-sm leading-6 text-neutral-800">
+                  {transcriptTurns.length ? (
+                    transcriptTurns.map((turn) => (
+                      <TranscriptBubble
+                        key={turn.id}
+                        label={turn.role === "user" ? "User" : "AI"}
+                        value={
+                          turn.translationStatus === "loading"
+                            ? "Translating..."
+                            : turn.translationStatus === "idle"
+                              ? "Translation appears when this turn is complete."
+                              : turn.english
+                        }
+                        muted={turn.translationStatus !== "ready"}
+                      />
+                    ))
+                  ) : (
+                    <span className="text-neutral-500">
+                      English translations will stay aligned with each German turn.
+                    </span>
+                  )}
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -801,10 +1289,36 @@ export function SpeakingLabClient() {
                   {feedback.cefrLevel} speaking estimate
                 </h2>
               </div>
-              <span className="rounded-full border border-neutral-200 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-neutral-600">
-                {feedbackSource === "demo" ? "Demo" : "OpenAI"}
-              </span>
+              <div className="flex flex-wrap justify-end gap-2">
+                <span className="rounded-full border border-neutral-200 px-3 py-1 text-xs font-semibold uppercase tracking-wide text-neutral-600">
+                  {feedbackSource === "demo" ? "Demo" : "OpenAI"}
+                </span>
+                {feedbackBasis ? (
+                  <span
+                    className={cn(
+                      "rounded-full border px-3 py-1 text-xs font-semibold uppercase tracking-wide",
+                      feedbackBasis === "audio"
+                        ? "border-teal-200 bg-teal-50 text-teal-800"
+                        : "border-amber-200 bg-amber-50 text-amber-800",
+                    )}
+                  >
+                    {feedbackBasis === "audio"
+                      ? "Audio-aware"
+                      : "Transcript-based"}
+                  </span>
+                ) : null}
+              </div>
             </div>
+
+            {feedbackWarning ? (
+              <div className="mt-4 flex gap-3 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+                <AlertTriangle className="mt-0.5 h-4 w-4 flex-none" />
+                <p>
+                  Audio-aware analysis was unavailable, so this attempt used the
+                  transcript: {feedbackWarning}
+                </p>
+              </div>
+            ) : null}
 
             <div className="mt-5 grid gap-4 lg:grid-cols-2">
               <FeedbackPanel title="Correct German" value={feedback.correctedGerman} />
@@ -819,20 +1333,45 @@ export function SpeakingLabClient() {
                 <p className="mt-2 text-sm leading-6 text-neutral-900">
                   {feedback.retryPrompt}
                 </p>
-                <button
-                  type="button"
-                  onClick={playModelSentence}
-                  className="mt-3 flex items-center gap-2 rounded-md bg-neutral-950 px-3 py-2 text-sm font-semibold text-white hover:bg-neutral-800"
-                >
-                  <Play className="h-4 w-4" />
-                  Hear retry
-                </button>
+                <SpeechPlaybackControls
+                  controller={speechPlayback}
+                  id={`speaking-retry-${activeTask.id}`}
+                  text={retrySentence}
+                  playLabel="Hear retry"
+                  className="mt-3"
+                />
               </div>
             </div>
 
+            {attemptComparison ? (
+              <div className="mt-5 rounded-lg border border-blue-200 bg-blue-50 p-4">
+                <p className="text-sm font-semibold text-blue-950">
+                  Improvement from your previous attempt
+                </p>
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <ImprovementMetric
+                    label="Fluency"
+                    previous={attemptComparison.previousFluency}
+                    current={attemptComparison.currentFluency}
+                    delta={attemptComparison.fluencyDelta}
+                  />
+                  <ImprovementMetric
+                    label="Task completion"
+                    previous={attemptComparison.previousTaskCompletion}
+                    current={attemptComparison.currentTaskCompletion}
+                    delta={attemptComparison.taskCompletionDelta}
+                  />
+                </div>
+              </div>
+            ) : null}
+
             <div className="mt-5 grid gap-4 lg:grid-cols-3">
               <IssueList
-                title="Pronunciation practice"
+                title={
+                  feedbackBasis === "audio"
+                    ? "Pronunciation and delivery"
+                    : "Pronunciation practice"
+                }
                 items={feedback.pronunciationIssues}
               />
               <IssueList
@@ -842,9 +1381,9 @@ export function SpeakingLabClient() {
                 )}
               />
               <IssueList
-                title="Vocabulary"
+                title="Vocabulary to use next time"
                 items={feedback.vocabularyAlternatives.map(
-                  (item) => `${item.original} -> ${item.better}`,
+                  (item) => `${item.original} → ${item.better}: ${item.reason}`,
                 )}
               />
             </div>
@@ -884,6 +1423,15 @@ export function SpeakingLabClient() {
                 </p>
               </div>
             </div>
+
+            <button
+              type="button"
+              onClick={prepareRetake}
+              className="mt-5 flex items-center gap-2 rounded-md bg-neutral-900 px-4 py-2 text-sm font-semibold text-white hover:bg-neutral-800"
+            >
+              <RotateCcw className="h-4 w-4" />
+              Retake this task
+            </button>
           </div>
         ) : null}
       </section>
@@ -912,7 +1460,7 @@ export function SpeakingLabClient() {
                   <div className="mt-3 h-2 rounded-full bg-neutral-200">
                     <div
                       className="h-2 rounded-full bg-teal-700"
-                      style={{ width: `${attempt.score}%` }}
+                      style={{ width: `${attempt.fluencyScore}%` }}
                     />
                   </div>
                 </div>
@@ -934,10 +1482,13 @@ export function SpeakingLabClient() {
             <li>Raw OpenAI key stays on the server.</li>
             <li>Browser receives only a short-lived realtime client secret.</li>
             <li>Save status is confirmed after every completed attempt.</li>
-            <li>Transcripts and feedback are saved; raw audio is not stored.</li>
             <li>
-              Pronunciation notes are practice suggestions inferred from the transcript,
-              not acoustic phoneme scoring.
+              Raw audio can be analyzed for delivery, then is discarded; transcripts
+              and feedback are saved.
+            </li>
+            <li>
+              Audio-aware attempts use audible delivery; transcript fallback is labeled
+              clearly and never claims acoustic phoneme scoring.
             </li>
             <li>Scores are practice estimates, not official exam grades.</li>
           </ul>
@@ -949,22 +1500,29 @@ export function SpeakingLabClient() {
             <p className="text-sm font-semibold">Fallback path</p>
           </div>
           <p className="mt-3 text-sm leading-6 text-neutral-700">
-            If live WebRTC voice fails, upload a short German audio clip or paste the
-            transcript and run the same correction engine.
+            If live WebRTC voice fails, upload a short German audio clip and run the
+            same correction engine.
           </p>
           <button
             type="button"
             onClick={() => {
               closeRealtimeSession();
-              window.speechSynthesis?.cancel();
-              setTranscript("");
-              setLiveTranscriptValue("");
-              setManualTranscript("");
+              speechPlayback.stop();
+              transcriptTurnsRef.current = [];
+              setTranscriptTurns([]);
               setFeedback(null);
               setFeedbackSource(null);
+              setFeedbackBasis(null);
+              setFeedbackWarning("");
               setError("");
               setSaveStatus("idle");
               setSaveMessage("");
+              setRoleplayPhase("idle");
+              roleplayUserChunksRef.current = 0;
+              roleplayAssistantRepliesRef.current = 0;
+              roleplaySpeechActiveRef.current = false;
+              pendingRoleplayResponseRef.current = false;
+              setRoleplayUserChunks(0);
               setStatus("idle");
             }}
             className="mt-4 flex items-center gap-2 rounded-md border border-neutral-300 px-3 py-2 text-sm font-semibold hover:bg-neutral-50"
@@ -987,6 +1545,39 @@ function FeedbackPanel({ title, value }: { title: string; value: string }) {
   );
 }
 
+function TranscriptBubble({
+  label,
+  value,
+  active = false,
+  muted = false,
+}: {
+  label: string;
+  value: string;
+  active?: boolean;
+  muted?: boolean;
+}) {
+  return (
+    <div className="rounded-md border border-neutral-200 bg-white p-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs font-semibold uppercase tracking-wide text-teal-700">
+          {label}
+        </p>
+        {active ? (
+          <span className="text-xs font-medium text-teal-700">Live</span>
+        ) : null}
+      </div>
+      <p
+        className={cn(
+          "mt-1 whitespace-pre-wrap text-sm leading-6",
+          muted ? "text-neutral-500" : "text-neutral-900",
+        )}
+      >
+        {value}
+      </p>
+    </div>
+  );
+}
+
 function ScorePanel({ label, score }: { label: string; score: number }) {
   return (
     <div className="rounded-lg border border-neutral-200 p-4">
@@ -997,6 +1588,42 @@ function ScorePanel({ label, score }: { label: string; score: number }) {
       <div className="mt-4 h-2 rounded-full bg-neutral-200">
         <div className="h-2 rounded-full bg-teal-700" style={{ width: `${score}%` }} />
       </div>
+    </div>
+  );
+}
+
+function ImprovementMetric({
+  label,
+  previous,
+  current,
+  delta,
+}: {
+  label: string;
+  previous: number;
+  current: number;
+  delta: number;
+}) {
+  return (
+    <div className="rounded-md border border-blue-200 bg-white p-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-sm font-semibold text-neutral-800">{label}</p>
+        <span
+          className={cn(
+            "text-sm font-semibold",
+            delta > 0
+              ? "text-teal-700"
+              : delta < 0
+                ? "text-rose-700"
+                : "text-neutral-600",
+          )}
+        >
+          {delta > 0 ? "+" : ""}
+          {delta}
+        </span>
+      </div>
+      <p className="mt-1 text-xs text-neutral-600">
+        {previous} → {current}
+      </p>
     </div>
   );
 }
@@ -1023,4 +1650,44 @@ function readErrorMessage(value: unknown, fallback: string) {
   }
 
   return fallback;
+}
+
+function customTaskPlaceholder(mode: SpeakingMode) {
+  const placeholders: Record<SpeakingMode, string> = {
+    pronunciation: "Enter the German text you want to pronounce...",
+    roleplay: "Describe the situation, roles, and what you want to achieve...",
+    exam: "Enter a topic you want to speak about without interruption...",
+    "weak-spot": "Enter a grammar or vocabulary speaking challenge...",
+    shadow: "Paste the longer German passage you want to shadow...",
+  };
+  return placeholders[mode];
+}
+
+function createSessionRecorder(stream: MediaStream, chunks: Blob[]) {
+  if (typeof MediaRecorder === "undefined") {
+    return null;
+  }
+
+  const preferredMimeTypes = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+  ];
+  const mimeType = preferredMimeTypes.find((type) =>
+    MediaRecorder.isTypeSupported(type),
+  );
+
+  try {
+    const recorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
+    recorder.addEventListener("dataavailable", (event) => {
+      if (event.data.size > 0) {
+        chunks.push(event.data);
+      }
+    });
+    return recorder;
+  } catch {
+    return null;
+  }
 }

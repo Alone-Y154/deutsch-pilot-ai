@@ -34,6 +34,8 @@ export async function POST(request: Request) {
   const taskTitle = readString(payload.taskTitle);
   const taskPrompt = readString(payload.taskPrompt);
   const transcript = readString(payload.transcript).trim();
+  const transcriptTurns = sanitizeTranscriptTurns(payload.transcriptTurns);
+  const analysisBasis = readString(payload.analysisBasis);
 
   if (!mode || !level || !taskTitle || !taskPrompt || !transcript || !feedback) {
     return Response.json(
@@ -69,7 +71,14 @@ export async function POST(request: Request) {
         typeof feedback.correctedGerman === "string"
           ? feedback.correctedGerman
           : null,
-      feedback,
+      feedback: {
+        ...feedback,
+        transcriptTurns,
+        analysisBasis:
+          analysisBasis === "audio" || analysisBasis === "transcript"
+            ? analysisBasis
+            : undefined,
+      },
       fluency_score: fluencyScore,
       task_completion_score: taskCompletionScore,
       weak_tags: weakTags,
@@ -137,4 +146,23 @@ function clampScore(score: number) {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function sanitizeTranscriptTurns(value: unknown) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.slice(0, 40).flatMap((turn) => {
+    if (!isRecord(turn)) return [];
+    const role = readString(turn.role);
+    const german = readString(turn.german).slice(0, 5000);
+    const english = readString(turn.english).slice(0, 5000);
+
+    if ((role !== "user" && role !== "assistant") || !german) {
+      return [];
+    }
+
+    return [{ role, german, english }];
+  });
 }

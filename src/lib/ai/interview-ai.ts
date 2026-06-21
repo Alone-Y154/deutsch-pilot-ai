@@ -37,6 +37,7 @@ export type InterviewAnswerFeedbackInput = InterviewSetupInput & {
   analysis: InterviewProfileAnalysis;
   question: InterviewQuestion;
   transcript: string;
+  acousticObservations?: string;
 };
 
 export type InterviewFinalReportInput = InterviewSetupInput & {
@@ -124,10 +125,11 @@ export async function generateInterviewAnswerFeedback(
     schemaName: "german_interview_answer_feedback",
     schema: interviewAnswerFeedbackJsonSchema,
     system:
-      "You are a German language examiner and interview coach. Grade spoken interview answers for language, role fit, structure, confidence, and job-signal coverage.",
+      "You are a German language examiner and interview coach. Grade spoken interview answers for language, role fit, structure, confidence, audible delivery, and job-signal coverage.",
     user: {
-      instruction:
-        "Assess the learner's spoken German answer. Give corrected German, a concise model answer, English feedback, language scores, interview scores, weak tags, and a retry prompt.",
+      instruction: input.acousticObservations
+        ? "Assess the learner's German answer using the transcript for language and content plus the supplied acoustic observations for pronunciation, pacing, pauses, clarity, and audible confidence. Give corrected German, a concise model answer, English feedback, language scores, interview scores, weak tags, and a retry prompt. Do not invent acoustic details."
+        : "Assess the learner's spoken German answer from the transcript. Give corrected German, a concise model answer, English feedback, language scores, interview scores, weak tags, and a retry prompt. Any pronunciation notes must be clearly labeled as transcript-based suggestions.",
       ...input,
     },
   });

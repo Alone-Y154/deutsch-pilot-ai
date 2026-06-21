@@ -13,6 +13,10 @@ import {
   getOpenAIErrorMessage,
   responsesUrl,
 } from "@/lib/ai/response-utils";
+import {
+  buildGermanTranscript,
+  validateListeningExerciseContent,
+} from "@/lib/listening-format";
 import { clampScore } from "@/lib/utils";
 
 export type ListeningExerciseRequest = {
@@ -57,7 +61,7 @@ export async function generateListeningExercise(
   };
 
   if (!apiKey) {
-    return { data: createDemoExercise(normalizedInput), source: "demo" };
+    return { data: createFormatDemoExercise(normalizedInput), source: "demo" };
   }
 
   const data = await runStructuredOpenAI({
@@ -65,23 +69,61 @@ export async function generateListeningExercise(
     schemaName: "german_listening_exercise",
     schema: listeningExerciseJsonSchema,
     system:
-      "You are DeutschPilot AI, a CEFR-aligned German listening assessment designer. Create natural spoken German and fair comprehension questions.",
+      "You are DeutschPilot AI, a CEFR-aligned German listening assessment designer. Create realistic spoken German and fair comprehension questions. Every spoken line, question, option, correct answer, and explanation must be in German.",
     user: {
       instruction:
-        "Create one self-contained German listening exercise. The transcript must sound natural when spoken aloud, match the requested CEFR level, and contain enough evidence for every answer. Questions may be in simple German or English, but options must be unambiguous. Do not refer to information outside the transcript. Return exactly the requested number of questions.",
+        "Create one self-contained German listening exercise. Use audioScript to separate every speaker turn. Never make one narrator read a multi-person conversation. The transcript must sound natural when spoken aloud, match the requested CEFR level, and contain enough evidence for every answer. ALL questions, options, correct answers, and explanations must be German. Do not refer to information outside the audio. Return exactly the requested number of questions.",
+      formatRequirements: formatRequirements(normalizedInput.format),
       ...normalizedInput,
     },
   });
 
-  const parsed = listeningExerciseSchema.parse(
+  let parsed = listeningExerciseSchema.parse(
     JSON.parse(extractOutputText(data)),
   );
+  let normalized: ListeningExercise;
+
+  try {
+    normalized = validateListeningExerciseContent({
+      ...parsed,
+      level: normalizedInput.level,
+      format: normalizedInput.format,
+      transcriptGerman: buildGermanTranscript(parsed.audioScript),
+      questions: parsed.questions.slice(0, normalizedInput.questionCount),
+    });
+  } catch (validationError) {
+    const repairedData = await runStructuredOpenAI({
+      apiKey,
+      schemaName: "german_listening_exercise_repair",
+      schema: listeningExerciseJsonSchema,
+      system:
+        "Repair German listening exercises. Return only the corrected structured exercise. Every spoken line and every question field must be German.",
+      user: {
+        instruction:
+          "Repair this draft. Enforce the supplied format requirements, use a distinct speaker for every real participant, and rewrite any English script, question, option, answer, or explanation into natural German. Preserve the requested CEFR level and question count.",
+        validationError:
+          validationError instanceof Error
+            ? validationError.message
+            : "Invalid listening exercise.",
+        formatRequirements: formatRequirements(normalizedInput.format),
+        requested: normalizedInput,
+        draft: parsed,
+      },
+    });
+    parsed = listeningExerciseSchema.parse(
+      JSON.parse(extractOutputText(repairedData)),
+    );
+    normalized = validateListeningExerciseContent({
+      ...parsed,
+      level: normalizedInput.level,
+      format: normalizedInput.format,
+      transcriptGerman: buildGermanTranscript(parsed.audioScript),
+      questions: parsed.questions.slice(0, normalizedInput.questionCount),
+    });
+  }
 
   return {
-    data: {
-      ...parsed,
-      questions: parsed.questions.slice(0, normalizedInput.questionCount),
-    },
+    data: normalized,
     source: "openai",
   };
 }
@@ -202,7 +244,7 @@ async function runStructuredOpenAI({
   return data;
 }
 
-function createDemoExercise(
+function createFormatDemoExercise(
   input: {
     level: "A1" | "A2" | "B1" | "B2" | "C1" | "C2";
     topic: string;
@@ -210,6 +252,53 @@ function createDemoExercise(
     questionCount: number;
   },
 ): ListeningExercise {
+  const content = demoFormatContent(input.format);
+  const questions = Array.from({ length: input.questionCount }, (_, index) => {
+    const question = content.questions[index % content.questions.length];
+    return { ...question, id: `q${index + 1}` };
+  });
+  const exercise: ListeningExercise = {
+    title: `${input.level} Hörverstehen: ${content.title}`,
+    level: input.level,
+    topic: input.topic,
+    format: input.format,
+    situation: content.situation,
+    instructions:
+      "Hören Sie zuerst ohne Transkript zu. Sie dürfen die Aufnahme wiederholen und beantworten danach alle Fragen.",
+    transcriptGerman: buildGermanTranscript(content.audioScript),
+    audioScript: content.audioScript,
+    durationEstimateSeconds: content.duration,
+    questions,
+    vocabularyAfterAnswer: [
+      {
+        german: "die Änderung",
+        english: "change",
+        note: "Eine Information wird korrigiert oder angepasst.",
+      },
+      {
+        german: "bestätigen",
+        english: "to confirm",
+        note: "Eine Angabe noch einmal klar zusagen.",
+      },
+      {
+        german: "rechtzeitig",
+        english: "on time",
+        note: "Früh genug vor einem Termin oder Ereignis.",
+      },
+    ],
+  };
+
+  return validateListeningExerciseContent(exercise);
+}
+
+export function createDemoExercise(
+  input: {
+    level: "A1" | "A2" | "B1" | "B2" | "C1" | "C2";
+    topic: string;
+    format: ListeningExercise["format"];
+    questionCount: number;
+  },
+): Omit<ListeningExercise, "audioScript"> {
   const questionPool: ListeningExercise["questions"] = [
     {
       id: "q1",
@@ -299,6 +388,140 @@ function createDemoExercise(
         german: "die Bestätigung",
         english: "confirmation",
         note: "A written confirmation of the change.",
+      },
+    ],
+  };
+}
+
+function formatRequirements(format: ListeningExercise["format"]) {
+  const requirements: Record<ListeningExercise["format"], string[]> = {
+    dialogue: [
+      "Use 2 or 3 named speakers with different roles.",
+      "Create 6-14 short alternating turns with greetings, reactions, clarification, and a natural close.",
+    ],
+    announcement: [
+      "Use exactly 1 announcer.",
+      "Sound like a real public announcement with location, timing, action, and one useful repetition.",
+    ],
+    interview: [
+      "Use exactly 2 speakers: interviewer and guest.",
+      "Create 6-14 alternating question-and-answer turns with at least one natural follow-up.",
+    ],
+    story: [
+      "Use one narrator unless direct quoted speech genuinely adds another character.",
+      "Create a coherent beginning, development, and ending with temporal markers.",
+    ],
+    news: [
+      "Use a professional anchor and optionally one reporter or interviewee.",
+      "Include a headline, details, context, and a concise close.",
+    ],
+  };
+  return requirements[format];
+}
+
+function demoFormatContent(
+  format: ListeningExercise["format"],
+): {
+  title: string;
+  situation: string;
+  duration: number;
+  audioScript: ListeningExercise["audioScript"];
+  questions: ListeningExercise["questions"];
+} {
+  const content = {
+    dialogue: {
+      title: "Termin im Bürgerbüro",
+      situation: "Ein Bürger ruft im Bürgerbüro an und verschiebt einen Termin.",
+      duration: 55,
+      audioScript: [
+        { speaker: "Mitarbeiterin", role: "Mitarbeiterin im Bürgerbüro", text: "Guten Tag, Bürgerbüro Mitte. Wie kann ich Ihnen helfen?" },
+        { speaker: "Karim", role: "Anrufer", text: "Guten Tag. Ich habe morgen um zehn Uhr einen Termin, kann aber leider nicht kommen." },
+        { speaker: "Mitarbeiterin", role: "Mitarbeiterin im Bürgerbüro", text: "Kein Problem. Möchten Sie den Termin auf Donnerstag oder Freitag verschieben?" },
+        { speaker: "Karim", role: "Anrufer", text: "Freitag wäre besser. Gibt es am Nachmittag einen freien Termin?" },
+        { speaker: "Mitarbeiterin", role: "Mitarbeiterin im Bürgerbüro", text: "Ja, um vierzehn Uhr dreißig ist noch etwas frei." },
+        { speaker: "Karim", role: "Anrufer", text: "Das passt gut. Muss ich meinen Reisepass mitbringen?" },
+        { speaker: "Mitarbeiterin", role: "Mitarbeiterin im Bürgerbüro", text: "Ja, bitte bringen Sie den Reisepass und die Terminbestätigung mit." },
+        { speaker: "Karim", role: "Anrufer", text: "Vielen Dank. Dann komme ich am Freitag um vierzehn Uhr dreißig." },
+      ],
+    },
+    announcement: {
+      title: "Gleiswechsel am Bahnhof",
+      situation: "Eine Bahnhofsdurchsage informiert über eine kurzfristige Änderung.",
+      duration: 38,
+      audioScript: [
+        { speaker: "Ansagerin", role: "Bahnhofsansagerin", text: "Achtung am Gleis sieben. Der Regionalexpress nach Nürnberg fährt heute nicht von Gleis sieben, sondern von Gleis elf ab. Die Abfahrt bleibt um sechzehn Uhr zwölf. Reisende nach Nürnberg gehen bitte sofort zu Gleis elf. Der Zug wartet dort ungefähr fünf Minuten. Wir wiederholen: Der Regionalexpress nach Nürnberg fährt heute von Gleis elf ab." },
+      ],
+    },
+    interview: {
+      title: "Nachhaltig zur Arbeit",
+      situation: "Eine Radiomoderatorin spricht mit einem Pendler über seinen Arbeitsweg.",
+      duration: 62,
+      audioScript: [
+        { speaker: "Moderatorin", role: "Radiomoderatorin", text: "Herr Wagner, Sie fahren seit einem Jahr jeden Tag mit dem Fahrrad zur Arbeit. Warum haben Sie damit angefangen?" },
+        { speaker: "Herr Wagner", role: "Pendler", text: "Mein Arbeitsweg ist nur sechs Kilometer lang. Mit dem Auto stand ich oft im Stau, deshalb wollte ich etwas Neues ausprobieren." },
+        { speaker: "Moderatorin", role: "Radiomoderatorin", text: "War die Umstellung am Anfang schwierig?" },
+        { speaker: "Herr Wagner", role: "Pendler", text: "Ein bisschen. Besonders im Winter brauchte ich gute Kleidung und mehr Zeit für die Vorbereitung." },
+        { speaker: "Moderatorin", role: "Radiomoderatorin", text: "Welche Vorteile merken Sie heute?" },
+        { speaker: "Herr Wagner", role: "Pendler", text: "Ich bin morgens wacher, bewege mich regelmäßig und spare Geld für Benzin und Parkplätze." },
+        { speaker: "Moderatorin", role: "Radiomoderatorin", text: "Fahren Sie auch bei starkem Regen?" },
+        { speaker: "Herr Wagner", role: "Pendler", text: "Nein, dann nehme ich den Bus. Für mich ist wichtig, flexibel zu bleiben." },
+      ],
+    },
+    story: {
+      title: "Eine verlorene Tasche",
+      situation: "Eine Erzählerin berichtet von einem unerwarteten Fund.",
+      duration: 58,
+      audioScript: [
+        { speaker: "Erzählerin", role: "Erzählerin", text: "Am Samstag fuhr Lena mit dem Bus in die Innenstadt. Als sie ausstieg, bemerkte sie eine kleine blaue Tasche unter ihrem Sitz. Sie öffnete die Tasche nicht, sondern brachte sie direkt zum Fahrer." },
+        { speaker: "Erzählerin", role: "Erzählerin", text: "Wenige Minuten später rannte eine ältere Frau zur Haltestelle zurück. Sie hatte ihre Tasche im Bus vergessen und war sehr erleichtert. Darin lagen ihre Schlüssel, wichtige Medikamente und ein Foto ihrer Familie. Die Frau bedankte sich bei Lena und lud sie spontan auf einen Kaffee ein." },
+      ],
+    },
+    news: {
+      title: "Neue Nachtbusse",
+      situation: "Eine lokale Nachrichtensendung berichtet über ein neues Verkehrsangebot.",
+      duration: 52,
+      audioScript: [
+        { speaker: "Nachrichtensprecher", role: "Moderator im Studio", text: "Die Stadt Freiburg erweitert ab kommendem Freitag ihr Nachtbusangebot. Drei zusätzliche Linien fahren dann in den Nächten von Freitag auf Samstag und von Samstag auf Sonntag." },
+        { speaker: "Reporterin", role: "Reporterin vor Ort", text: "Die Busse starten jeweils um ein Uhr, zwei Uhr dreißig und vier Uhr am Hauptbahnhof. Ein normales Monatsticket gilt auch für die neuen Verbindungen. Die Stadt reagiert damit auf Wünsche von Studierenden und Beschäftigten in der Gastronomie." },
+        { speaker: "Nachrichtensprecher", role: "Moderator im Studio", text: "Nach einer Testphase von sechs Monaten entscheidet der Gemeinderat, ob das Angebot dauerhaft bleibt." },
+      ],
+    },
+  } satisfies Record<
+    ListeningExercise["format"],
+    {
+      title: string;
+      situation: string;
+      duration: number;
+      audioScript: ListeningExercise["audioScript"];
+    }
+  >;
+
+  return {
+    ...content[format],
+    questions: [
+      {
+        id: "q1",
+        skill: "main-idea",
+        prompt: "Worum geht es in der Aufnahme hauptsächlich?",
+        options: ["Um eine wichtige Information oder Änderung", "Um ein privates Rezept", "Um einen Sprachkurs"],
+        correctOption: "Um eine wichtige Information oder Änderung",
+        explanation: "Die Aufnahme vermittelt eine konkrete Information in einer realistischen Situation.",
+      },
+      {
+        id: "q2",
+        skill: "detail",
+        prompt: "Welche Angabe ist für die beteiligten Personen besonders wichtig?",
+        options: ["Zeit, Ort oder nächster Schritt", "Die Lieblingsfarbe", "Das Wetter im Ausland"],
+        correctOption: "Zeit, Ort oder nächster Schritt",
+        explanation: "Die Aufnahme nennt praktische Details, die für das weitere Handeln wichtig sind.",
+      },
+      {
+        id: "q3",
+        skill: "inference",
+        prompt: "Was sollen die Hörerinnen und Hörer nach der Aufnahme verstehen?",
+        options: ["Wie sie auf die Situation reagieren sollen", "Wie man ein Gedicht schreibt", "Wie alt alle Personen sind"],
+        correctOption: "Wie sie auf die Situation reagieren sollen",
+        explanation: "Aus den genannten Details ergibt sich eine klare Reaktion oder Schlussfolgerung.",
       },
     ],
   };

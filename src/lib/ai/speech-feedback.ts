@@ -18,6 +18,8 @@ export type SpeechFeedbackRequest = {
   taskTitle: string;
   taskPrompt: string;
   target?: string;
+  conversationTranscript?: string;
+  acousticObservations?: string;
 };
 
 type SpeechFeedbackResult = {
@@ -89,13 +91,12 @@ export async function generateSpeechFeedback(
         {
           role: "system",
           content:
-            "You are a strict but encouraging German speaking examiner and pronunciation coach. Return only valid structured feedback. Do not claim official exam grading.",
+            "You are an encouraging German speaking assessor. Practice comes first: reward successful communication, identify the few highest-value improvements, and avoid overwhelming the learner. Return only valid structured feedback. Do not claim official exam grading.",
         },
         {
           role: "user",
           content: JSON.stringify({
-            instruction:
-              "Correct the learner's spoken German. Focus on grammar, vocabulary, sentence structure, fluency, task completion, and CEFR estimate. Pronunciation notes must be clearly framed as practice suggestions inferred from spelling and phrasing in the transcript; do not claim acoustic or phoneme analysis. Keep explanations in English and examples in German.",
+            instruction: buildFeedbackInstruction(input),
             ...input,
           }),
         },
@@ -129,4 +130,29 @@ export async function generateSpeechFeedback(
     feedback: parsed.data,
     source: "openai",
   };
+}
+
+function buildFeedbackInstruction(input: SpeechFeedbackRequest) {
+  const basis = input.acousticObservations
+    ? "Use the transcript for language accuracy and the supplied acoustic observations for audible pronunciation, rhythm, pacing, pauses, stress, clarity, and confidence. Do not invent phoneme measurements."
+    : "Pronunciation notes are transcript-based practice suggestions only; do not claim acoustic analysis.";
+  const modeGuidance: Record<string, string> = {
+    pronunciation:
+      "Prioritize intelligibility, delivery, and a short useful retry. Do not turn this into a long grammar lesson.",
+    roleplay:
+      "Assess whether the learner communicated naturally and achieved the roleplay goal. Minor mistakes should not outweigh successful communication.",
+    exam:
+      "Assess structure, relevance, supporting reasons, examples, connectors, and sustained speaking. Suggest vocabulary that would strengthen a retake.",
+    "weak-spot":
+      "Focus on whether the target form was used successfully in original spoken sentences.",
+    shadow:
+      "Compare the spoken delivery with the target passage. Prioritize sustained rhythm, phrasing, stress, clarity, and completion.",
+  };
+
+  return [
+    basis,
+    modeGuidance[input.mode] || "Assess practical spoken communication.",
+    "Focus on grammar, vocabulary, sentence structure, fluency, task completion, and CEFR estimate.",
+    "Give only the few highest-value corrections. Keep explanations in English and examples in German.",
+  ].join(" ");
 }

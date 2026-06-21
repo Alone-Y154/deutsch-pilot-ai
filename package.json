@@ -7,7 +7,9 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:speaking": "node --test --experimental-strip-types tests/speaking-session.test.ts",
+    "test:labs": "node --test --experimental-strip-types tests/speaking-session.test.ts tests/listening-interview.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.10.3",

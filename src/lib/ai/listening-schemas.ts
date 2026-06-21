@@ -1,6 +1,23 @@
 import { z } from "zod";
 
 export const listeningLevelSchema = z.enum(["A1", "A2", "B1", "B2", "C1", "C2"]);
+export const listeningFormatSchema = z.enum([
+  "dialogue",
+  "announcement",
+  "interview",
+  "story",
+  "news",
+]);
+export type ListeningFormat = z.infer<typeof listeningFormatSchema>;
+
+export const listeningAudioScriptSegmentSchema = z.object({
+  speaker: z.string().min(1).max(60),
+  role: z.string().min(1).max(100),
+  text: z.string().min(2).max(1200),
+});
+export type ListeningAudioScriptSegment = z.infer<
+  typeof listeningAudioScriptSegmentSchema
+>;
 
 export const listeningQuestionSchema = z.object({
   id: z.string(),
@@ -15,10 +32,11 @@ export const listeningExerciseSchema = z.object({
   title: z.string(),
   level: listeningLevelSchema,
   topic: z.string(),
-  format: z.enum(["dialogue", "announcement", "interview", "story", "news"]),
+  format: listeningFormatSchema,
   situation: z.string(),
   instructions: z.string(),
   transcriptGerman: z.string(),
+  audioScript: z.array(listeningAudioScriptSegmentSchema).min(1).max(16),
   durationEstimateSeconds: z.number().int().min(20).max(240),
   questions: z.array(listeningQuestionSchema).min(3).max(8),
   vocabularyAfterAnswer: z.array(
@@ -64,6 +82,7 @@ export const listeningExerciseJsonSchema = {
     "situation",
     "instructions",
     "transcriptGerman",
+    "audioScript",
     "durationEstimateSeconds",
     "questions",
     "vocabularyAfterAnswer",
@@ -79,6 +98,21 @@ export const listeningExerciseJsonSchema = {
     situation: { type: "string" },
     instructions: { type: "string" },
     transcriptGerman: { type: "string" },
+    audioScript: {
+      type: "array",
+      minItems: 1,
+      maxItems: 16,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["speaker", "role", "text"],
+        properties: {
+          speaker: { type: "string" },
+          role: { type: "string" },
+          text: { type: "string" },
+        },
+      },
+    },
     durationEstimateSeconds: {
       type: "integer",
       minimum: 20,
